@@ -1,5 +1,0 @@
-{
-  "bulbasaur bulba.jpg": "John_Doe_VIP",
-  "minion.jpg": "Jane_Smith_VIP",
-  "psyduckpsy.jpg": "Elon_Musk_VIP"
-}

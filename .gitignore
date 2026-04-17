@@ -1,0 +1,17 @@
+# Python / Backend
+backend/venv/
+__pycache__/
+*.pyc
+backend/.env
+backend/gcp-keys.json
+backend/temp_processing/
+
+# Flutter / Frontend
+frontend/.dart_tool/
+frontend/build/
+frontend/.flutter-plugins
+frontend/.flutter-plugins-dependencies
+
+# OS Files
+.DS_Store
+Thumbs.db

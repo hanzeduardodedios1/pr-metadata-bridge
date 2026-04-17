@@ -4,7 +4,10 @@ import zipfile
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import FileResponse
-
+from app.services.exif_logic import process_event_directory
+from app.services.ocr_service import extract_text
+from dotenv import load_dotenv
+load_dotenv()  # This forces FastAPI to read your .env file on startup
 # Import our brains
 from app.services.exif_logic import process_event_directory
 
@@ -73,3 +76,27 @@ async def process_batch_sync(file_archive: UploadFile = File(...)):
         filename="Tagged_Event_Photos.zip",
         media_type="application/zip"
     )
+
+@app.post("/scan-badge")
+async def scan_badge(file: UploadFile = File(...)):
+    """
+    Receives a single image file from Flutter, sends it to Google Vision,
+    and returns the extracted VIP name.
+    """
+    print(f"🔍 Received badge for scanning: {file.filename}")
+    
+    # Read the file into memory
+    img_bytes = await file.read()
+    
+    # Send to Google Cloud Vision
+    text = extract_text(img_bytes)
+    
+    # Clean up the string (replace newlines with spaces for a cleaner EXIF tag)
+    clean_text = " ".join(text.split())
+    
+    print(f"✅ Extracted Text: {clean_text}")
+    
+    return {
+        "filename": file.filename,
+        "extracted_text": clean_text
+    }
