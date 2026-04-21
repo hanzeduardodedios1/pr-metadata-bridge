@@ -1,15 +1,15 @@
-import os
-import shutil
-import zipfile
+from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
-from fastapi.responses import FileResponse
-from app.services.exif_logic import process_event_directory
 from app.services.ocr_service import extract_text
 from dotenv import load_dotenv
+from app.services.exif_logic import process_manifest_in_place
+
 load_dotenv()  # This forces FastAPI to read your .env file on startup
-# Import our brains
-from app.services.exif_logic import process_event_directory
+
+
+class ProcessBatchRequest(BaseModel):
+    manifest: dict[str, str]
 
 # Initialize FastAPI
 app = FastAPI(
@@ -32,50 +32,13 @@ async def health_check():
     return {"status": "healthy", "service": "pr-metadata-bridge"}
 
 @app.post("/process-batch")
-async def process_batch_sync(file_archive: UploadFile = File(...)):
+async def process_batch(payload: ProcessBatchRequest):
     """
-    Receives a zip file, extracts it, runs the Exif logic, 
-    and returns the tagged zip file.
+    Receives a JSON manifest mapping file paths to VIP names and injects
+    metadata in-place into each existing file after host-side path resolution.
     """
-    print(f"📦 Received file: {file_archive.filename}")
-    
-    # 1. Setup temporary directories
-    base_dir = os.path.dirname(os.path.dirname(__file__))
-    temp_dir = os.path.join(base_dir, "temp_processing")
-    extract_dir = os.path.join(temp_dir, "extracted")
-    output_zip = os.path.join(temp_dir, "tagged_deliverables.zip")
-
-    # Clean up previous runs if they exist
-    if os.path.exists(temp_dir):
-        shutil.rmtree(temp_dir)
-    os.makedirs(extract_dir, exist_ok=True)
-
-    # 2. Save the uploaded zip locally
-    zip_path = os.path.join(temp_dir, file_archive.filename)
-    with open(zip_path, "wb") as buffer:
-        shutil.copyfileobj(file_archive.file, buffer)
-
-    # 3. Extract the files
-    print("🗜️ Extracting files...")
-    with zipfile.ZipFile(zip_path, 'r') as zip_ref:
-        zip_ref.extractall(extract_dir)
-
-    # 4. Run the Core Logic!
-    print("🧠 Running EXIF logic...")
-    process_event_directory(extract_dir)
-
-    # 5. Zip the processed files back up
-    print("🤐 Re-zipping deliverables...")
-    # shutil.make_archive creates the zip without needing the .zip extension in the target name
-    shutil.make_archive(output_zip.replace('.zip', ''), 'zip', extract_dir)
-
-    # 6. Return the file to the client
-    print("🚀 Sending deliverables back to client.")
-    return FileResponse(
-        path=output_zip,
-        filename="Tagged_Event_Photos.zip",
-        media_type="application/zip"
-    )
+    processed_count = process_manifest_in_place(payload.manifest)
+    return {"status": "success", "processed_count": processed_count}
 
 @app.post("/scan-badge")
 async def scan_badge(file: UploadFile = File(...)):

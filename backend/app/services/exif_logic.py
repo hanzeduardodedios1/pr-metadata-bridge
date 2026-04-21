@@ -1,54 +1,62 @@
 import os
-import json
+from pathlib import Path, PureWindowsPath
 from exiftool import ExifToolHelper
 
-def process_event_directory(directory_path: str):
+def _resolve_manifest_path(manifest_path: str) -> Path:
     """
-    Reads the manifest.json provided by the Flutter frontend 
-    and directly injects the specified tags.
+    Resolve a manifest key (Windows or POSIX-style) to an absolute host path.
     """
-    print(f"🚀 Starting deterministic pipeline for directory: {directory_path}")
-    
-    # 1. Hunt down the manifest file, no matter how deep it is or if it has a .txt extension
-    manifest_path = None
-    for root, dirs, files in os.walk(directory_path):
-        for file in files:
-            if file.lower() in ["manifest.json", "manifest.json.txt"]:
-                manifest_path = os.path.join(root, file)
-                break
-        if manifest_path:
-            break
-    
-    if not manifest_path:
-        print("❌ CRITICAL ERROR: No manifest.json found in the payload.")
-        return
+    raw_value = (manifest_path or "").strip()
+    if not raw_value:
+        raise ValueError("Manifest path is empty")
 
-    # 2. Load the explicit instructions
-    with open(manifest_path, "r") as f:
-        tag_mapping = json.load(f)
-        
-    print(f"📜 Loaded manifest from {os.path.basename(manifest_path)} with {len(tag_mapping)} tagging instructions.")
+    if os.name == "nt":
+        # Windows host: normalize separators and keep drive/UNC semantics.
+        candidate = Path(PureWindowsPath(raw_value))
+    else:
+        # POSIX host: accept both slash styles by converting backslashes first.
+        candidate = Path(str(PureWindowsPath(raw_value)).replace("\\", "/"))
 
-    # 3. Build a quick lookup dictionary of all files in the extracted folder
-    file_locator = {}
-    for root, dirs, files in os.walk(directory_path):
-        for file in files:
-            file_locator[file] = os.path.join(root, file)
+    if not candidate.is_absolute():
+        # If a relative path somehow appears in the manifest, anchor it safely.
+        candidate = (Path.cwd() / candidate).resolve()
+    else:
+        candidate = candidate.resolve()
 
-    # 4. Inject the tags exactly as instructed
+    return candidate
+
+
+def process_manifest_in_place(manifest: dict[str, str]) -> int:
+    """
+    Processes a map of absolute file paths -> VIP names and injects
+    EXIF/IPTC/XMP tags directly into each original file on disk.
+
+    Returns the number of files successfully processed.
+    """
+    print(f"🚀 Starting in-place processing for {len(manifest)} files.")
+    processed_count = 0
+
     with ExifToolHelper() as et:
-        for filename, vip_name in tag_mapping.items():
-            if filename in file_locator:
-                target_file = file_locator[filename]
-                print(f"   -> Injecting '{vip_name}' into {filename}")
-                
-                tags_to_inject = {
-                    "EXIF:ImageDescription": vip_name,
-                    "IPTC:Keywords": vip_name,
-                    "XMP:Subject": vip_name
-                }
-                et.set_tags(target_file, tags=tags_to_inject, params=["-overwrite_original"])
-            else:
-                print(f"   ⚠️ Warning: '{filename}' was in manifest but not found in folder.")
+        for manifest_key, vip_name in manifest.items():
+            try:
+                resolved_path = _resolve_manifest_path(manifest_key)
+            except (OSError, RuntimeError, ValueError) as exc:
+                print(f"   ⚠️ Warning: invalid path '{manifest_key}': {exc}. Skipping.")
+                continue
+
+            if not resolved_path.is_file():
+                print(f"   ⚠️ Warning: '{resolved_path}' does not exist. Skipping.")
+                continue
+
+            print(f"   -> Injecting '{vip_name}' into {resolved_path}")
+            tags_to_inject = {
+                "EXIF:ImageDescription": vip_name,
+                "IPTC:Keywords": vip_name,
+                "XMP:Subject": vip_name,
+            }
+            # ExifToolHelper uses argument lists under the hood, so paths with spaces are safe.
+            et.set_tags(str(resolved_path), tags=tags_to_inject, params=["-overwrite_original"])
+            processed_count += 1
 
     print("✅ Processing Complete.")
+    return processed_count
