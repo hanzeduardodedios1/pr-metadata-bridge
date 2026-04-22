@@ -2,6 +2,7 @@ import multiprocessing
 import logging
 import os
 import sys
+from contextlib import asynccontextmanager
 from pathlib import Path
 from typing import Any
 
@@ -12,34 +13,35 @@ import requests
 import uvicorn
 from dotenv import load_dotenv
 from app.services.exif_logic import process_manifest_in_place
+try:
+    from platformdirs import user_log_path
+except ImportError:  # pragma: no cover - optional dependency fallback
+    user_log_path = None
 
-if getattr(sys, "frozen", False):
-    # Running as PyInstaller executable
-    env_path = os.path.join(os.path.dirname(sys.executable), ".env")
-else:
-    # Running as normal Python script
-    env_path = os.path.join(
-        os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env"
-    )
-
-load_dotenv(env_path)
+bundle_dir = (
+    Path(sys.executable).parent
+    if getattr(sys, "frozen", False)
+    else Path(__file__).parent
+)
+load_dotenv(bundle_dir / ".env")
 
 REQUEST_TIMEOUT_SECONDS = 20
 LOGGER_NAME = "pr_metadata_bridge"
 logger = logging.getLogger(LOGGER_NAME)
 
 
-def _runtime_base_dir() -> Path:
-    if getattr(sys, "frozen", False):
-        return Path(sys.executable).resolve().parent
-    return Path.cwd()
-
-
 def _configure_logging() -> None:
     if logger.handlers:
         return
 
-    logs_dir = _runtime_base_dir() / "logs"
+    if user_log_path is not None:
+        logs_dir = user_log_path(appname="CaptionFast", ensure_exists=True)
+    else:
+        local_app_data = Path(
+            os.environ.get("LOCALAPPDATA", str(Path.home() / "AppData" / "Local"))
+        )
+        logs_dir = local_app_data / "CaptionFast" / "logs"
+
     logs_dir.mkdir(parents=True, exist_ok=True)
     log_file = logs_dir / "backend.log"
 
@@ -85,11 +87,20 @@ _configure_logging()
 class ProcessBatchRequest(BaseModel):
     manifest: dict[str, str]
 
+
+@asynccontextmanager
+async def lifespan(_: FastAPI):
+    logger.info("Local backend starting on 8003")
+    yield
+    logger.info("Local backend shutting down")
+
+
 # Initialize FastAPI
 app = FastAPI(
     title="PR Metadata Bridge API",
     description="Microservice for automated EXIF metadata injection via OCR",
-    version="0.1.0"
+    version="0.1.0",
+    lifespan=lifespan,
 )
 
 # CORS Middleware (Permissive for local Flutter Desktop client)
@@ -110,11 +121,6 @@ async def root():
 async def health():
     """Lightweight liveness probe for the desktop client startup gate."""
     return {"status": "ok"}
-
-
-@app.on_event("startup")
-async def on_startup() -> None:
-    logger.info("Local backend starting on 8003")
 
 
 @app.post("/process-batch")
@@ -168,7 +174,7 @@ async def scan_badge(file: UploadFile = File(...)):
         return {"status": "error", "message": "Proxy offline"}
 
     try:
-        headers = {"X-API-Key": api_key}
+        headers = {"X-API-Key": os.getenv("PROXY_API_KEY", "").strip()}
         masked_headers: dict[str, Any] = {
             "X-API-Key": _mask_api_key(headers["X-API-Key"])
         }
