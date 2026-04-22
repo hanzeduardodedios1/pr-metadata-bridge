@@ -21,6 +21,18 @@ final Uri _kBackendHealthUri = Uri(
 const Duration _kHealthPollInterval = Duration(seconds: 1);
 const Duration _kHealthWaitTimeout = Duration(seconds: 15);
 const Duration _kHealthRequestTimeout = Duration(seconds: 2);
+const Duration _kBackendGracefulShutdownTimeout = Duration(seconds: 2);
+const Duration _kBackendForceShutdownTimeout = Duration(seconds: 1);
+const Color _kBrutalistBackground = Color(0xFF282828);
+const Color _kBrutalistSidebar = Color(0xFF1E1E1E);
+const Color _kBrutalistBorder = Color(0xFF2A2A2A);
+const Color _kBrutalistPrimaryText = Colors.white;
+const Color _kBrutalistSecondaryText = Color(0xFF8B8C90);
+const Color _kBrutalistButton = Color(0xFF3D7AB5);
+const double _kLabelFontSize = 11;
+const double _kInputFontSize = 13;
+const double _kSectionHeaderFontSize = 15;
+const double _kPanelTitleFontSize = 18;
 
 final backendHostProvider = ChangeNotifierProvider<BackendHostController>(
   (ref) => throw StateError('backendHostProvider must be overridden in main()'),
@@ -59,13 +71,31 @@ Future<bool> pingBackendHealth() async {
 class BackendHostController extends ChangeNotifier {
   Process? _process;
   bool _ownsProcess = false;
+  bool _isShuttingDown = false;
+  Future<void>? _shutdownFuture;
   bool _canSendHttp = false;
   String? _bootstrapMessage;
+  StreamSubscription<List<int>>? _stdoutSubscription;
+  StreamSubscription<List<int>>? _stderrSubscription;
 
   bool get canSendHttp => _canSendHttp;
 
   /// Shown when the backend is unavailable or failed to start.
   String? get bootstrapMessage => _bootstrapMessage;
+
+  /// Explicitly asks the owned backend process to terminate.
+  /// This is used by the window close path before destroying the Flutter UI.
+  void requestOwnedProcessKill() {
+    final proc = _process;
+    if (!_ownsProcess || proc == null) {
+      return;
+    }
+    try {
+      proc.kill(ProcessSignal.sigterm);
+    } catch (_) {
+      // Best effort: process may already be gone.
+    }
+  }
 
   Future<void> bootstrap() async {
     _canSendHttp = false;
@@ -101,6 +131,9 @@ class BackendHostController extends ChangeNotifier {
         mode: ProcessStartMode.normal,
       );
       _ownsProcess = true;
+      // Drain child process pipes so the backend cannot block on full buffers.
+      _stdoutSubscription = _process!.stdout.listen((_) {});
+      _stderrSubscription = _process!.stderr.listen((_) {});
     } catch (e) {
       _bootstrapMessage = 'Failed to start backend.exe: $e';
       notifyListeners();
@@ -136,23 +169,57 @@ class BackendHostController extends ChangeNotifier {
   /// Stops [backend.exe] if this app started it (avoids killing a separately
   /// launched dev server).
   Future<void> shutdownOwned() async {
-    if (!_ownsProcess || _process == null) {
+    if (_shutdownFuture != null) {
+      await _shutdownFuture;
       return;
     }
+    if (_isShuttingDown || !_ownsProcess || _process == null) {
+      return;
+    }
+
+    _shutdownFuture = _shutdownOwnedInternal();
+    try {
+      await _shutdownFuture;
+    } finally {
+      _shutdownFuture = null;
+    }
+  }
+
+  Future<void> _shutdownOwnedInternal() async {
+    _isShuttingDown = true;
     final proc = _process!;
     _process = null;
     _ownsProcess = false;
+
     try {
+      // Ask the backend to exit gracefully first.
       proc.kill(ProcessSignal.sigterm);
     } catch (_) {
       // Already exited.
     }
+
+    final stdoutSubscription = _stdoutSubscription;
+    final stderrSubscription = _stderrSubscription;
+    _stdoutSubscription = null;
+    _stderrSubscription = null;
+    await stdoutSubscription?.cancel();
+    await stderrSubscription?.cancel();
+
     try {
-      await proc.exitCode.timeout(const Duration(seconds: 5));
+      await proc.exitCode.timeout(_kBackendGracefulShutdownTimeout);
     } on TimeoutException {
       try {
         proc.kill(ProcessSignal.sigkill);
-      } catch (_) {}
+      } catch (_) {
+        // Process may have exited between timeout and kill attempt.
+      }
+      try {
+        await proc.exitCode.timeout(_kBackendForceShutdownTimeout);
+      } catch (_) {
+        // Best-effort shutdown complete.
+      }
+    } finally {
+      _isShuttingDown = false;
     }
   }
 }
@@ -180,14 +247,19 @@ class ImagePathsNotifier extends StateNotifier<List<String>> {
 
   String _normalizePath(String rawPath) => p.normalize(rawPath);
 
-  Future<void> pickFolderAndLoadJpegs() async {
+  Future<bool> pickFolderAndLoadJpegs() async {
     final selectedDirectory = await FilePicker.platform.getDirectoryPath(
       dialogTitle: 'Select Folder with JPEG Images',
     );
     if (selectedDirectory == null) {
-      return;
+      return false;
     }
 
+    loadJpegsFromDirectory(selectedDirectory);
+    return true;
+  }
+
+  void loadJpegsFromDirectory(String selectedDirectory) {
     final directory = Directory(selectedDirectory);
     final files =
         directory
@@ -204,6 +276,10 @@ class ImagePathsNotifier extends StateNotifier<List<String>> {
   bool _isJpeg(String filePath) {
     final ext = p.extension(filePath).toLowerCase();
     return ext == '.jpg' || ext == '.jpeg';
+  }
+
+  void clear() {
+    state = const [];
   }
 }
 
@@ -287,12 +363,15 @@ class App extends ConsumerStatefulWidget {
   ConsumerState<App> createState() => _AppState();
 }
 
-class _AppState extends ConsumerState<App> with WindowListener {
+class _AppState extends ConsumerState<App>
+    with WindowListener, WidgetsBindingObserver {
   static bool get _manageWindowClose => !kIsWeb && Platform.isWindows;
+  bool _isShuttingDown = false;
 
   @override
   void initState() {
     super.initState();
+    WidgetsBinding.instance.addObserver(this);
     if (_manageWindowClose) {
       windowManager.addListener(this);
     }
@@ -300,6 +379,7 @@ class _AppState extends ConsumerState<App> with WindowListener {
 
   @override
   void dispose() {
+    WidgetsBinding.instance.removeObserver(this);
     if (_manageWindowClose) {
       windowManager.removeListener(this);
     }
@@ -307,16 +387,35 @@ class _AppState extends ConsumerState<App> with WindowListener {
   }
 
   @override
-  void onWindowClose() {
-    if (!_manageWindowClose) {
+  void onWindowClose() async {
+    if (!_manageWindowClose || _isShuttingDown) {
       return;
     }
-    unawaited(_shutdownBackendAndCloseWindow());
+    await _beginShutdown();
   }
 
-  Future<void> _shutdownBackendAndCloseWindow() async {
-    await ref.read(backendHostProvider).shutdownOwned();
-    await windowManager.destroy();
+  @override
+  void didChangeAppLifecycleState(AppLifecycleState state) {
+    if (state == AppLifecycleState.detached) {
+      unawaited(_beginShutdown());
+    }
+  }
+
+  Future<void> _beginShutdown() async {
+    if (_isShuttingDown) {
+      return;
+    }
+    _isShuttingDown = true;
+    try {
+      ref.read(backendHostProvider).requestOwnedProcessKill();
+      await ref.read(backendHostProvider).shutdownOwned();
+      if (_manageWindowClose) {
+        await windowManager.setPreventClose(false);
+      }
+      exit(0);
+    } catch (_) {
+      exit(0);
+    }
   }
 
   @override
@@ -324,7 +423,95 @@ class _AppState extends ConsumerState<App> with WindowListener {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
       title: 'VIP Tagger',
-      theme: ThemeData.dark(),
+      theme: ThemeData(
+        brightness: Brightness.dark,
+        scaffoldBackgroundColor: _kBrutalistBackground,
+        canvasColor: _kBrutalistBackground,
+        colorScheme: const ColorScheme.dark(
+          surface: _kBrutalistBackground,
+          primary: _kBrutalistButton,
+          onPrimary: _kBrutalistPrimaryText,
+          onSurface: _kBrutalistPrimaryText,
+        ),
+        textTheme: const TextTheme(
+          bodyLarge: TextStyle(
+            color: _kBrutalistPrimaryText,
+            fontSize: _kInputFontSize,
+          ),
+          bodyMedium: TextStyle(
+            color: _kBrutalistPrimaryText,
+            fontSize: _kInputFontSize,
+          ),
+          titleLarge: TextStyle(
+            color: _kBrutalistPrimaryText,
+            fontWeight: FontWeight.w600,
+            fontSize: _kPanelTitleFontSize,
+          ),
+        ),
+        dividerColor: _kBrutalistBorder,
+        shadowColor: Colors.transparent,
+        splashColor: Colors.transparent,
+        hoverColor: Colors.transparent,
+        highlightColor: Colors.transparent,
+        appBarTheme: const AppBarTheme(
+          elevation: 0,
+          shadowColor: Colors.transparent,
+          backgroundColor: _kBrutalistBackground,
+        ),
+        cardTheme: const CardThemeData(
+          color: _kBrutalistBackground,
+          elevation: 0,
+          shadowColor: Colors.transparent,
+          margin: EdgeInsets.zero,
+        ),
+        elevatedButtonTheme: ElevatedButtonThemeData(
+          style: ElevatedButton.styleFrom(
+            elevation: 0,
+            shadowColor: Colors.transparent,
+            backgroundColor: _kBrutalistButton,
+            foregroundColor: _kBrutalistPrimaryText,
+            disabledBackgroundColor: const Color(0xFF353535),
+            disabledForegroundColor: const Color(0xFF6D6E73),
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.zero,
+              side: BorderSide(color: _kBrutalistBorder, width: 1),
+            ),
+          ),
+        ),
+        textButtonTheme: TextButtonThemeData(
+          style: TextButton.styleFrom(
+            foregroundColor: _kBrutalistPrimaryText,
+            shape: const RoundedRectangleBorder(
+              borderRadius: BorderRadius.zero,
+              side: BorderSide(color: _kBrutalistBorder, width: 1),
+            ),
+          ),
+        ),
+        listTileTheme: const ListTileThemeData(
+          shape: RoundedRectangleBorder(borderRadius: BorderRadius.zero),
+        ),
+        inputDecorationTheme: const InputDecorationTheme(
+          labelStyle: TextStyle(color: _kBrutalistSecondaryText),
+          hintStyle: TextStyle(
+            color: _kBrutalistSecondaryText,
+            fontSize: _kInputFontSize,
+          ),
+          filled: true,
+          fillColor: _kBrutalistSidebar,
+          enabledBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.zero,
+            borderSide: BorderSide(color: _kBrutalistBorder, width: 1),
+          ),
+          focusedBorder: OutlineInputBorder(
+            borderRadius: BorderRadius.zero,
+            borderSide: BorderSide(color: _kBrutalistPrimaryText, width: 1),
+          ),
+          border: OutlineInputBorder(
+            borderRadius: BorderRadius.zero,
+            borderSide: BorderSide(color: _kBrutalistBorder, width: 1),
+          ),
+        ),
+      ),
       home: const StartupGate(child: HomePage()),
     );
   }
@@ -445,9 +632,139 @@ class _FullScreenStartupOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: const Color(0xFF12131A),
+      backgroundColor: _kBrutalistBackground,
       body: Center(child: child),
     );
+  }
+}
+
+class _PrimaryActionButton extends StatefulWidget {
+  const _PrimaryActionButton({
+    required this.onPressed,
+    required this.child,
+    this.padding,
+  });
+
+  final VoidCallback? onPressed;
+  final Widget child;
+  final EdgeInsetsGeometry? padding;
+
+  @override
+  State<_PrimaryActionButton> createState() => _PrimaryActionButtonState();
+}
+
+class _PrimaryActionButtonState extends State<_PrimaryActionButton> {
+  bool _hovering = false;
+  bool _pressed = false;
+
+  double get _scale {
+    if (_pressed) {
+      return 0.98;
+    }
+    if (_hovering) {
+      return 1.015;
+    }
+    return 1;
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    final disabled = widget.onPressed == null;
+    return MouseRegion(
+      onEnter: (_) => setState(() => _hovering = true),
+      onExit: (_) {
+        setState(() {
+          _hovering = false;
+          _pressed = false;
+        });
+      },
+      child: GestureDetector(
+        onTapDown: disabled ? null : (_) => setState(() => _pressed = true),
+        onTapUp: disabled ? null : (_) => setState(() => _pressed = false),
+        onTapCancel: disabled ? null : () => setState(() => _pressed = false),
+        child: AnimatedScale(
+          scale: _scale,
+          duration: const Duration(milliseconds: 170),
+          curve: Curves.easeOutBack,
+          child: ElevatedButton(
+            onPressed: widget.onPressed,
+            style: ElevatedButton.styleFrom(
+              padding:
+                  widget.padding ??
+                  const EdgeInsets.symmetric(horizontal: 16, vertical: 14),
+            ),
+            child: widget.child,
+          ),
+        ),
+      ),
+    );
+  }
+}
+
+class _DashedBorder extends StatelessWidget {
+  const _DashedBorder({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return CustomPaint(
+      painter: const _DashedBorderPainter(),
+      child: child,
+    );
+  }
+}
+
+class _DashedBorderPainter extends CustomPainter {
+  const _DashedBorderPainter();
+
+  @override
+  void paint(Canvas canvas, Size size) {
+    const color = _kBrutalistBorder;
+    const strokeWidth = 1.0;
+    const dashLength = 8.0;
+    const gapLength = 6.0;
+    final paint = Paint()
+      ..color = color
+      ..style = PaintingStyle.stroke
+      ..strokeWidth = strokeWidth;
+
+    void drawDashedLine(Offset start, Offset end) {
+      final dx = end.dx - start.dx;
+      final dy = end.dy - start.dy;
+      final distance = dx.abs() + dy.abs();
+      final directionX = distance == 0 ? 0.0 : dx / distance;
+      final directionY = distance == 0 ? 0.0 : dy / distance;
+      double drawn = 0;
+      while (drawn < distance) {
+        final dashEnd = (drawn + dashLength).clamp(0, distance);
+        final p1 = Offset(
+          start.dx + directionX * drawn,
+          start.dy + directionY * drawn,
+        );
+        final p2 = Offset(
+          start.dx + directionX * dashEnd,
+          start.dy + directionY * dashEnd,
+        );
+        canvas.drawLine(p1, p2, paint);
+        drawn += dashLength + gapLength;
+      }
+    }
+
+    final left = strokeWidth / 2;
+    final top = strokeWidth / 2;
+    final right = size.width - strokeWidth / 2;
+    final bottom = size.height - strokeWidth / 2;
+
+    drawDashedLine(Offset(left, top), Offset(right, top));
+    drawDashedLine(Offset(right, top), Offset(right, bottom));
+    drawDashedLine(Offset(right, bottom), Offset(left, bottom));
+    drawDashedLine(Offset(left, bottom), Offset(left, top));
+  }
+
+  @override
+  bool shouldRepaint(covariant _DashedBorderPainter oldDelegate) {
+    return false;
   }
 }
 
@@ -471,13 +788,14 @@ class _HomePageState extends ConsumerState<HomePage> {
   };
 
   final _tagController = TextEditingController();
-  final _leftSidebarWidth = 250.0;
-  final _rightSidebarWidth = 300.0;
   bool _isScanning = false;
   bool _isProcessingBatch = false;
+  bool _showProcessSuccess = false;
+  Timer? _processSuccessTimer;
 
   @override
   void dispose() {
+    _processSuccessTimer?.cancel();
     _tagController.dispose();
     super.dispose();
   }
@@ -492,6 +810,95 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   void _process() {
     _processBatch();
+  }
+
+  String? _activeFolderBreadcrumb(List<String> imagePaths) {
+    if (imagePaths.isEmpty) {
+      return null;
+    }
+    var folderPath = p.normalize(p.dirname(imagePaths.first));
+    final homePath =
+        Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'];
+    if (homePath != null && homePath.isNotEmpty) {
+      final normalizedHome = p.normalize(homePath);
+      if (folderPath.toLowerCase().startsWith(normalizedHome.toLowerCase())) {
+        folderPath = '~${folderPath.substring(normalizedHome.length)}';
+      }
+    }
+    if (!folderPath.endsWith(p.separator)) {
+      folderPath = '$folderPath${p.separator}';
+    }
+    return folderPath.replaceAll('\\', '/');
+  }
+
+  void _clearCurrentSelectionAndTags() {
+    ref.read(selectedFilesProvider.notifier).clear();
+    setState(() {
+      _tagController.clear();
+    });
+  }
+
+  Future<void> _pickFolderFromBreadcrumb() async {
+    final tags = ref.read(taggedFilesProvider);
+    if (tags.isNotEmpty) {
+      final shouldDiscard = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: const Text('Discard tagged photos?'),
+            content: Text(
+              "You have ${tags.length} tagged photos that haven't been processed.",
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: const Text('Load Anyway'),
+              ),
+            ],
+          );
+        },
+      );
+      if (shouldDiscard != true) {
+        return;
+      }
+    }
+
+    final selectedDirectory = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Select Folder with JPEG Images',
+    );
+    if (selectedDirectory == null) {
+      return;
+    }
+
+    ref.read(loadedFilesProvider.notifier).clear();
+    ref.read(selectedFilesProvider.notifier).clear();
+    ref.read(taggedFilesProvider.notifier).clear();
+    setState(() {
+      _showProcessSuccess = false;
+      _tagController.clear();
+    });
+    ref.read(loadedFilesProvider.notifier).loadJpegsFromDirectory(
+      selectedDirectory,
+    );
+  }
+
+  void _showProcessSuccessState() {
+    _processSuccessTimer?.cancel();
+    setState(() {
+      _showProcessSuccess = true;
+    });
+    _processSuccessTimer = Timer(const Duration(seconds: 2), () {
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _showProcessSuccess = false;
+      });
+    });
   }
 
   void _showScanFailedSnackBar() {
@@ -621,9 +1028,9 @@ class _HomePageState extends ConsumerState<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(content: Text('Metadata injected successfully!')),
       );
-      // Optional UX: clear after successful processing.
+      _clearCurrentSelectionAndTags();
       ref.read(taggedFilesProvider.notifier).clear();
-      ref.read(selectedFilesProvider.notifier).clear();
+      _showProcessSuccessState();
     } catch (_) {
       if (!mounted) {
         return;
@@ -650,8 +1057,6 @@ class _HomePageState extends ConsumerState<HomePage> {
     final selected = ref.watch(selectedFilesProvider);
     final tags = ref.watch(taggedFilesProvider);
     final backend = ref.watch(backendHostProvider);
-    const sidebarColor = Color(0xFF1E1F24);
-    const contentColor = Color(0xFF272932);
 
     return Scaffold(
       body: Column(
@@ -676,220 +1081,465 @@ class _HomePageState extends ConsumerState<HomePage> {
           Expanded(
             child: Row(
               children: [
-                Container(
-                  width: _leftSidebarWidth,
-                  color: sidebarColor,
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      ElevatedButton(
-                        onPressed: () async => ref
-                            .read(loadedFilesProvider.notifier)
-                            .pickFolderAndLoadJpegs(),
-                        style: ElevatedButton.styleFrom(
-                          padding: const EdgeInsets.symmetric(vertical: 16),
-                        ),
-                        child: const Text('Select Folder'),
-                      ),
-                      const SizedBox(height: 16),
-                      Expanded(
-                        child: ListView.separated(
-                          itemCount: imagePaths.length,
-                          separatorBuilder: (_, _) => const Divider(height: 1),
-                          itemBuilder: (context, index) {
-                            final filePath = imagePaths[index];
-                            final isSelected = selected.contains(filePath);
-                            return ListTile(
-                              dense: true,
-                              title: Text(
-                                p.basename(filePath),
-                                maxLines: 1,
-                                overflow: TextOverflow.ellipsis,
-                              ),
-                              selected: isSelected,
-                              onTap: () => ref
-                                  .read(selectedFilesProvider.notifier)
-                                  .toggle(filePath),
-                            );
-                          },
-                        ),
-                      ),
-                    ],
-                  ),
-                ),
                 Expanded(
+                  flex: 7,
                   child: Container(
-                    color: contentColor,
+                    decoration: const BoxDecoration(
+                      color: _kBrutalistBackground,
+                    ),
                     padding: const EdgeInsets.all(16),
-                    child: imagePaths.isEmpty
-                        ? const Center(
-                            child: Text(
-                              'No JPEG files loaded',
-                              style: TextStyle(fontSize: 18),
+                    child: Column(
+                      children: [
+                        Row(
+                          children: [
+                            Expanded(
+                              child: Builder(
+                                builder: (context) {
+                                  final breadcrumb =
+                                      _activeFolderBreadcrumb(imagePaths);
+                                  if (breadcrumb == null) {
+                                    return const SizedBox.shrink();
+                                  }
+                                  return InkWell(
+                                    onTap: _pickFolderFromBreadcrumb,
+                                    child: Row(
+                                      children: [
+                                        const Icon(
+                                          Icons.folder_open,
+                                          size: 12,
+                                          color: _kBrutalistSecondaryText,
+                                        ),
+                                        const SizedBox(width: 6),
+                                        Expanded(
+                                          child: Text(
+                                            breadcrumb,
+                                            maxLines: 1,
+                                            overflow: TextOverflow.ellipsis,
+                                            style: const TextStyle(
+                                              fontSize: 11,
+                                              color: _kBrutalistSecondaryText,
+                                            ),
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  );
+                                },
+                              ),
                             ),
-                          )
-                        : GridView.builder(
-                            gridDelegate:
-                                const SliverGridDelegateWithMaxCrossAxisExtent(
-                                  maxCrossAxisExtent: 260,
-                                  childAspectRatio: 0.95,
-                                  crossAxisSpacing: 12,
-                                  mainAxisSpacing: 12,
-                                ),
-                            itemCount: imagePaths.length,
-                            itemBuilder: (context, index) {
-                              final filePath = imagePaths[index];
-                              final fileName = p.basename(filePath);
-                              final isSelected = selected.contains(filePath);
-                              final assignedTag = tags[filePath];
-
-                              return InkWell(
-                                onTap: () => ref
-                                    .read(selectedFilesProvider.notifier)
-                                    .toggle(filePath),
-                                child: Container(
-                                  decoration: BoxDecoration(
-                                    color: const Color(0xFF1B1D24),
-                                    borderRadius: BorderRadius.circular(8),
-                                    border: Border.all(
-                                      color: isSelected
-                                          ? const Color(0xFF1EA7FF)
-                                          : Colors.white24,
-                                      width: isSelected ? 3 : 1,
+                          ],
+                        ),
+                        const SizedBox(height: 16),
+                        Expanded(
+                          child: imagePaths.isEmpty
+                              ? Center(
+                                  child: ConstrainedBox(
+                                    constraints: const BoxConstraints(
+                                      maxWidth: 700,
+                                    ),
+                                    child: _DashedBorder(
+                                      child: InkWell(
+                                        onTap: () async {
+                                          await ref
+                                              .read(
+                                                loadedFilesProvider.notifier,
+                                              )
+                                              .pickFolderAndLoadJpegs();
+                                        },
+                                        child: Container(
+                                          width: double.infinity,
+                                          padding: const EdgeInsets.symmetric(
+                                            horizontal: 28,
+                                            vertical: 72,
+                                          ),
+                                          child: const Column(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              Icon(
+                                                Icons.add_photo_alternate_outlined,
+                                                size: 54,
+                                                color: _kBrutalistSecondaryText,
+                                              ),
+                                              SizedBox(height: 18),
+                                              Text(
+                                                'Drop folder here or click to browse',
+                                                style: TextStyle(
+                                                  color: _kBrutalistPrimaryText,
+                                                  fontSize: _kPanelTitleFontSize,
+                                                  fontWeight: FontWeight.w500,
+                                                ),
+                                                textAlign: TextAlign.center,
+                                              ),
+                                              SizedBox(height: 10),
+                                              Text(
+                                                '1. Load folder → 2. Select anchor → 3. Process',
+                                                style: TextStyle(
+                                                  color:
+                                                      _kBrutalistSecondaryText,
+                                                  fontSize: _kInputFontSize,
+                                                ),
+                                                textAlign: TextAlign.center,
+                                              ),
+                                            ],
+                                          ),
+                                        ),
+                                      ),
                                     ),
                                   ),
-                                  padding: const EdgeInsets.all(8),
-                                  child: Column(
-                                    crossAxisAlignment:
-                                        CrossAxisAlignment.start,
-                                    children: [
-                                      Expanded(
-                                        child: ClipRRect(
-                                          borderRadius: BorderRadius.circular(
-                                            6,
+                                )
+                              : LayoutBuilder(
+                                  builder: (context, constraints) {
+                                    final crossAxisCount =
+                                        (constraints.maxWidth / 220)
+                                            .floor()
+                                            .clamp(2, 8);
+                                    return GridView.builder(
+                                      gridDelegate:
+                                          SliverGridDelegateWithFixedCrossAxisCount(
+                                            crossAxisCount: crossAxisCount,
+                                            childAspectRatio: 0.88,
+                                            crossAxisSpacing: 12,
+                                            mainAxisSpacing: 12,
                                           ),
-                                          child: Image.file(
-                                            File(filePath),
-                                            fit: BoxFit.cover,
-                                            width: double.infinity,
-                                            errorBuilder: (_, _, _) =>
-                                                Container(
-                                                  color: Colors.black38,
-                                                  alignment: Alignment.center,
-                                                  child: const Text(
-                                                    'Preview N/A',
+                                      itemCount: imagePaths.length,
+                                      itemBuilder: (context, index) {
+                                        final filePath = imagePaths[index];
+                                        final fileName = p.basename(filePath);
+                                        final isSelected = selected.contains(
+                                          filePath,
+                                        );
+                                        final assignedTag = tags[filePath];
+
+                                        return InkWell(
+                                          onTap: () => ref
+                                              .read(selectedFilesProvider.notifier)
+                                              .toggle(filePath),
+                                          child: Container(
+                                            decoration: BoxDecoration(
+                                              color: _kBrutalistSidebar,
+                                              border: Border.all(
+                                                color: isSelected
+                                                    ? _kBrutalistButton
+                                                    : _kBrutalistBorder,
+                                                width: 1,
+                                              ),
+                                            ),
+                                            padding: const EdgeInsets.all(8),
+                                            child: Column(
+                                              crossAxisAlignment:
+                                                  CrossAxisAlignment.start,
+                                              children: [
+                                                Expanded(
+                                                  child: Image.file(
+                                                    File(filePath),
+                                                    fit: BoxFit.cover,
+                                                    width: double.infinity,
+                                                    errorBuilder:
+                                                        (_, _, _) => Container(
+                                                          color: const Color(
+                                                            0xFF222224,
+                                                          ),
+                                                          alignment:
+                                                              Alignment.center,
+                                                          child: const Text(
+                                                            'Preview N/A',
+                                                            style: TextStyle(
+                                                              color:
+                                                                  _kBrutalistSecondaryText,
+                                                              fontSize:
+                                                                  _kLabelFontSize,
+                                                            ),
+                                                          ),
+                                                        ),
                                                   ),
                                                 ),
+                                                const SizedBox(height: 8),
+                                                Text(
+                                                  fileName,
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color:
+                                                        _kBrutalistPrimaryText,
+                                                    fontSize: _kInputFontSize,
+                                                    fontWeight: FontWeight.w600,
+                                                  ),
+                                                ),
+                                                Text(
+                                                  assignedTag == null
+                                                      ? 'Tag: (none)'
+                                                      : 'Tag: $assignedTag',
+                                                  maxLines: 1,
+                                                  overflow:
+                                                      TextOverflow.ellipsis,
+                                                  style: const TextStyle(
+                                                    color:
+                                                        _kBrutalistSecondaryText,
+                                                    fontSize: _kLabelFontSize,
+                                                  ),
+                                                ),
+                                              ],
+                                            ),
                                           ),
-                                        ),
-                                      ),
-                                      const SizedBox(height: 8),
-                                      Text(
-                                        fileName,
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                      ),
-                                      Text(
-                                        assignedTag == null
-                                            ? 'Tag: (none)'
-                                            : 'Tag: $assignedTag',
-                                        maxLines: 1,
-                                        overflow: TextOverflow.ellipsis,
-                                        style: const TextStyle(
-                                          color: Colors.white70,
-                                        ),
-                                      ),
-                                    ],
-                                  ),
+                                        );
+                                      },
+                                    );
+                                  },
                                 ),
-                              );
-                            },
-                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
-                Container(
-                  width: _rightSidebarWidth,
-                  color: sidebarColor,
-                  padding: const EdgeInsets.all(16),
-                  child: Column(
-                    crossAxisAlignment: CrossAxisAlignment.stretch,
-                    children: [
-                      const Text(
-                        'Anchor Scanner',
-                        style: TextStyle(
-                          fontSize: 18,
-                          fontWeight: FontWeight.bold,
-                        ),
-                      ),
-                      const SizedBox(height: 16),
-                      ElevatedButton(
-                        onPressed:
-                            selected.isEmpty ||
-                                _isScanning ||
-                                !backend.canSendHttp
-                            ? null
-                            : _scanSelectedAnchorPhoto,
-                        child: _isScanning
-                            ? const SizedBox(
-                                height: 18,
-                                width: 18,
-                                child: CircularProgressIndicator(
-                                  strokeWidth: 2,
-                                ),
-                              )
-                            : const Text('Scan Selected Anchor Photo'),
-                      ),
-                      const SizedBox(height: 12),
-                      TextField(
-                        controller: _tagController,
-                        decoration: const InputDecoration(
-                          labelText: 'VIP Name',
-                          border: OutlineInputBorder(),
-                        ),
-                      ),
-                      const SizedBox(height: 12),
-                      ElevatedButton(
-                        onPressed: _assignTag,
-                        child: const Text('Assign Name to Selected'),
-                      ),
-                      const SizedBox(height: 16),
-                      const Divider(),
-                      const SizedBox(height: 8),
-                      Text(
-                        'Loaded: ${imagePaths.length}  Selected: ${selected.length}  Tagged: ${tags.length}',
-                        style: const TextStyle(color: Colors.white70),
-                      ),
-                      const Spacer(),
-                      SizedBox(
-                        height: 64,
-                        child: ElevatedButton(
-                          onPressed: _isProcessingBatch || !backend.canSendHttp
-                              ? null
-                              : _process,
-                          style: ElevatedButton.styleFrom(
-                            backgroundColor: const Color(0xFF1EA7FF),
-                            foregroundColor: Colors.black,
-                            textStyle: const TextStyle(
-                              fontSize: 20,
-                              fontWeight: FontWeight.w700,
+                Container(width: 1, color: _kBrutalistBorder),
+                Expanded(
+                  flex: 3,
+                  child: Container(
+                    color: _kBrutalistSidebar,
+                    child: Column(
+                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                      children: [
+                        const Padding(
+                          padding: EdgeInsets.fromLTRB(16, 16, 16, 0),
+                          child: Text(
+                            'Inspector',
+                            style: TextStyle(
+                              fontSize: _kPanelTitleFontSize,
+                              fontWeight: FontWeight.w600,
+                              color: _kBrutalistPrimaryText,
                             ),
                           ),
-                          child: _isProcessingBatch
-                              ? const SizedBox(
-                                  height: 24,
-                                  width: 24,
-                                  child: CircularProgressIndicator(
-                                    strokeWidth: 3,
-                                  ),
-                                )
-                              : const Text('Process Batch'),
                         ),
-                      ),
-                    ],
+                        const SizedBox(height: 16),
+                        Padding(
+                          padding: const EdgeInsets.symmetric(horizontal: 16),
+                          child: Wrap(
+                            spacing: 8,
+                            runSpacing: 8,
+                            children: [
+                              _MetricPill(
+                                label: 'Loaded',
+                                value: imagePaths.length,
+                              ),
+                              _MetricPill(
+                                label: 'Selected',
+                                value: selected.length,
+                              ),
+                              _MetricPill(label: 'Tagged', value: tags.length),
+                            ],
+                          ),
+                        ),
+                        const SizedBox(height: 12),
+                        Expanded(
+                          child: SingleChildScrollView(
+                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                            child: Column(
+                              crossAxisAlignment: CrossAxisAlignment.stretch,
+                              children: [
+                                const _StepHeading(number: 1, label: 'Anchor'),
+                                const SizedBox(height: 8),
+                                _PrimaryActionButton(
+                                  onPressed:
+                                      selected.isEmpty ||
+                                          _isScanning ||
+                                          !backend.canSendHttp
+                                      ? null
+                                      : _scanSelectedAnchorPhoto,
+                                  child: _isScanning
+                                      ? const SizedBox(
+                                          height: 18,
+                                          width: 18,
+                                          child: CircularProgressIndicator(
+                                            strokeWidth: 2,
+                                            color: _kBrutalistPrimaryText,
+                                          ),
+                                        )
+                                      : const Text('Scan Selected Anchor Photo'),
+                                ),
+                                const SizedBox(height: 20),
+                                const Divider(height: 1, color: _kBrutalistBorder),
+                                const SizedBox(height: 20),
+                                const _StepHeading(number: 2, label: 'Subject'),
+                                const SizedBox(height: 8),
+                                const Text(
+                                  'Subject Name',
+                                  style: TextStyle(
+                                    fontSize: _kLabelFontSize,
+                                    color: _kBrutalistSecondaryText,
+                                    fontWeight: FontWeight.w500,
+                                  ),
+                                ),
+                                const SizedBox(height: 6),
+                                TextField(
+                                  controller: _tagController,
+                                  style: const TextStyle(
+                                    fontSize: _kInputFontSize,
+                                  ),
+                                  decoration: const InputDecoration(
+                                    hintText: 'Enter subject name',
+                                    border: OutlineInputBorder(),
+                                  ),
+                                ),
+                                const SizedBox(height: 20),
+                                const Divider(height: 1, color: _kBrutalistBorder),
+                                const SizedBox(height: 20),
+                                const _StepHeading(number: 3, label: 'Tag'),
+                                const SizedBox(height: 8),
+                                _PrimaryActionButton(
+                                  onPressed: _assignTag,
+                                  child: const Text('Assign Name to Selected'),
+                                ),
+                                const SizedBox(height: 10),
+                                SizedBox(
+                                  width: double.infinity,
+                                  child: OutlinedButton(
+                                    onPressed: _clearCurrentSelectionAndTags,
+                                    style: OutlinedButton.styleFrom(
+                                      backgroundColor: Colors.transparent,
+                                      foregroundColor: _kBrutalistButton,
+                                      side: const BorderSide(
+                                        color: _kBrutalistButton,
+                                        width: 1,
+                                      ),
+                                      shape: const RoundedRectangleBorder(
+                                        borderRadius: BorderRadius.zero,
+                                      ),
+                                      padding: const EdgeInsets.symmetric(
+                                        vertical: 14,
+                                      ),
+                                    ),
+                                    child: const Row(
+                                      mainAxisAlignment:
+                                          MainAxisAlignment.center,
+                                      children: [
+                                        Icon(Icons.clear_all, size: 18),
+                                        SizedBox(width: 8),
+                                        Text('Clear Selection'),
+                                      ],
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 20),
+                                const Divider(height: 1, color: _kBrutalistBorder),
+                              ],
+                            ),
+                          ),
+                        ),
+                        Container(
+                          padding: const EdgeInsets.all(16),
+                          decoration: const BoxDecoration(
+                            color: _kBrutalistSidebar,
+                            border: Border(
+                              top: BorderSide(color: _kBrutalistBorder, width: 1),
+                            ),
+                          ),
+                          child: SizedBox(
+                            height: 70,
+                            child: _PrimaryActionButton(
+                              onPressed: _isProcessingBatch || !backend.canSendHttp
+                                  ? null
+                                  : _process,
+                              padding: const EdgeInsets.symmetric(vertical: 20),
+                              child: _isProcessingBatch
+                                  ? const SizedBox(
+                                      height: 24,
+                                      width: 24,
+                                      child: CircularProgressIndicator(
+                                        strokeWidth: 3,
+                                        color: _kBrutalistPrimaryText,
+                                      ),
+                                    )
+                                  : Text(
+                                      _showProcessSuccess
+                                          ? 'Success!'
+                                          : 'Process Batch',
+                                      style: const TextStyle(
+                                        fontSize: _kPanelTitleFontSize,
+                                        fontWeight: FontWeight.w700,
+                                      ),
+                                    ),
+                            ),
+                          ),
+                        ),
+                      ],
+                    ),
                   ),
                 ),
               ],
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _StepHeading extends StatelessWidget {
+  const _StepHeading({required this.number, required this.label});
+
+  final int number;
+  final String label;
+
+  @override
+  Widget build(BuildContext context) {
+    return RichText(
+      text: TextSpan(
+        children: [
+          TextSpan(
+            text: 'Step $number: ',
+            style: const TextStyle(
+              color: _kBrutalistSecondaryText,
+              fontSize: _kSectionHeaderFontSize,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+          TextSpan(
+            text: label,
+            style: const TextStyle(
+              color: _kBrutalistPrimaryText,
+              fontSize: _kSectionHeaderFontSize,
+              fontWeight: FontWeight.w500,
+            ),
+          ),
+        ],
+      ),
+    );
+  }
+}
+
+class _MetricPill extends StatelessWidget {
+  const _MetricPill({required this.label, required this.value});
+
+  final String label;
+  final int value;
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      padding: const EdgeInsets.symmetric(horizontal: 10, vertical: 4),
+      decoration: BoxDecoration(
+        color: const Color(0xFF2A2A2A),
+        borderRadius: BorderRadius.circular(12),
+        border: Border.all(color: const Color(0xFF3A3A3A), width: 1),
+      ),
+      child: Row(
+        mainAxisSize: MainAxisSize.min,
+        children: [
+          Text(
+            label,
+            style: const TextStyle(
+              color: _kBrutalistSecondaryText,
+              fontSize: 11,
+            ),
+          ),
+          const SizedBox(width: 4),
+          Text(
+            '$value',
+            style: const TextStyle(
+              color: Colors.white,
+              fontSize: 13,
+              fontWeight: FontWeight.w600,
             ),
           ),
         ],

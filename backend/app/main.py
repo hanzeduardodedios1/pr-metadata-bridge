@@ -1,6 +1,9 @@
+import multiprocessing
+
 from pydantic import BaseModel
 from fastapi import FastAPI, UploadFile, File
 from fastapi.middleware.cors import CORSMiddleware
+import uvicorn
 from app.services.ocr_service import extract_text
 from dotenv import load_dotenv
 from app.services.exif_logic import process_manifest_in_place
@@ -69,3 +72,8 @@ async def scan_badge(file: UploadFile = File(...)):
         "filename": file.filename,
         "extracted_text": clean_text
     }
+
+
+if __name__ == "__main__":
+    multiprocessing.freeze_support()
+    uvicorn.run(app, host="127.0.0.1", port=8001)
