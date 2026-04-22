@@ -3,7 +3,6 @@ backend/venv/
 __pycache__/
 *.pyc
 backend/.env
-backend/gcp-keys.json
 backend/temp_processing/
 
 # Flutter / Frontend

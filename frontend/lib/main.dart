@@ -10,8 +10,9 @@ import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
 import 'package:window_manager/window_manager.dart';
 
+const String backendBaseUrl = "http://127.0.0.1:8003";
 const String _kBackendHost = '127.0.0.1';
-const int _kBackendPort = 8001;
+const int _kBackendPort = 8003;
 final Uri _kBackendHealthUri = Uri(
   scheme: 'http',
   host: _kBackendHost,
@@ -29,6 +30,8 @@ const Color _kBrutalistBorder = Color(0xFF2A2A2A);
 const Color _kBrutalistPrimaryText = Colors.white;
 const Color _kBrutalistSecondaryText = Color(0xFF8B8C90);
 const Color _kBrutalistButton = Color(0xFF3D7AB5);
+const Color _kStartupBackground = Color(0xFF1E1E1E);
+const Color _kStartupDivider = Color(0xFF2A2A2A);
 const double _kLabelFontSize = 11;
 const double _kInputFontSize = 13;
 const double _kSectionHeaderFontSize = 15;
@@ -60,8 +63,12 @@ Future<bool> pingBackendHealth() async {
     final response = await http
         .get(_kBackendHealthUri)
         .timeout(_kHealthRequestTimeout);
+    debugPrint(
+      'Health check response: status=${response.statusCode}, body=${response.body}',
+    );
     return response.statusCode == 200;
-  } catch (_) {
+  } catch (error) {
+    debugPrint('Health check request failed: $error');
     return false;
   }
 }
@@ -116,6 +123,7 @@ class BackendHostController extends ChangeNotifier {
 
     final exeDir = File(Platform.resolvedExecutable).parent.path;
     final backendExe = p.join(exeDir, 'backend.exe');
+    debugPrint('Backend spawn path: $backendExe');
     if (!await File(backendExe).exists()) {
       _bootstrapMessage =
           'backend.exe was not found next to the application:\n$backendExe';
@@ -147,18 +155,22 @@ class BackendHostController extends ChangeNotifier {
   /// Polls [pingBackendHealth] until success or [_kHealthWaitTimeout] elapses.
   Future<bool> waitForBackendHttpReady() async {
     final deadline = DateTime.now().add(_kHealthWaitTimeout);
+    var attempt = 1;
     while (DateTime.now().isBefore(deadline)) {
-      if (await pingBackendHealth()) {
+      final isHealthy = await pingBackendHealth();
+      debugPrint('Health check attempt $attempt result: $isHealthy');
+      if (isHealthy) {
         _canSendHttp = true;
         _bootstrapMessage = null;
         notifyListeners();
         return true;
       }
+      attempt += 1;
       await Future<void>.delayed(_kHealthPollInterval);
     }
     _canSendHttp = false;
     _bootstrapMessage =
-        'Failed to initialize the local engine. Please restart the application or check if port 8001 is in use.';
+        'Failed to initialize the local engine. Please restart the application or check if port $_kBackendPort is in use.';
     if (_ownsProcess) {
       await shutdownOwned();
     }
@@ -531,14 +543,43 @@ class StartupGate extends ConsumerStatefulWidget {
 }
 
 class _StartupGateState extends ConsumerState<StartupGate> {
+  static const List<String> _kStartupStatusMessages = <String>[
+    'Starting backend engine...',
+    'Connecting to Vision API...',
+    'Ready.',
+  ];
+
   _StartupGatePhase _phase = _StartupGatePhase.loading;
   String? _errorText;
+  String _statusMessage = _kStartupStatusMessages.first;
+  Timer? _statusTimer;
+  int _statusMessageIndex = 0;
 
   @override
   void initState() {
     super.initState();
+    _startStatusMessageRotation();
     WidgetsBinding.instance.addPostFrameCallback((_) {
       unawaited(_runStartup());
+    });
+  }
+
+  @override
+  void dispose() {
+    _statusTimer?.cancel();
+    super.dispose();
+  }
+
+  void _startStatusMessageRotation() {
+    _statusTimer = Timer.periodic(const Duration(milliseconds: 1500), (_) {
+      if (!mounted || _phase != _StartupGatePhase.loading) {
+        return;
+      }
+
+      setState(() {
+        _statusMessageIndex = (_statusMessageIndex + 1) % 2;
+        _statusMessage = _kStartupStatusMessages[_statusMessageIndex];
+      });
     });
   }
 
@@ -564,6 +605,15 @@ class _StartupGateState extends ConsumerState<StartupGate> {
     }
 
     if (ok) {
+      _statusTimer?.cancel();
+      setState(() {
+        _statusMessageIndex = 2;
+        _statusMessage = _kStartupStatusMessages[_statusMessageIndex];
+      });
+      await Future<void>.delayed(const Duration(milliseconds: 400));
+      if (!mounted) {
+        return;
+      }
       setState(() => _phase = _StartupGatePhase.ready);
     } else {
       setState(() {
@@ -579,20 +629,68 @@ class _StartupGateState extends ConsumerState<StartupGate> {
       case _StartupGatePhase.ready:
         return widget.child;
       case _StartupGatePhase.loading:
-        return const _FullScreenStartupOverlay(
-          child: Column(
-            mainAxisSize: MainAxisSize.min,
+        return _FullScreenStartupOverlay(
+          child: Stack(
+            alignment: Alignment.center,
             children: [
-              SizedBox(
-                width: 48,
-                height: 48,
-                child: CircularProgressIndicator(strokeWidth: 3),
+              Column(
+                mainAxisAlignment: MainAxisAlignment.center,
+                children: [
+                  const Icon(Icons.camera, size: 48, color: _kBrutalistButton),
+                  const SizedBox(height: 12),
+                  const Text(
+                    'CaptionFast',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 28,
+                      fontWeight: FontWeight.w700,
+                      letterSpacing: 1.2,
+                      color: Colors.white,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'Professional Event Photo Captioning',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: 13,
+                      fontWeight: FontWeight.w400,
+                      color: _kBrutalistSecondaryText,
+                    ),
+                  ),
+                  const SizedBox(height: 32),
+                  Container(width: 40, height: 1, color: _kStartupDivider),
+                  const SizedBox(height: 32),
+                  const SizedBox(
+                    width: 32,
+                    height: 32,
+                    child: CircularProgressIndicator(
+                      strokeWidth: 2.5,
+                      color: _kBrutalistButton,
+                    ),
+                  ),
+                  const SizedBox(height: 16),
+                  Text(
+                    _statusMessage,
+                    textAlign: TextAlign.center,
+                    style: const TextStyle(
+                      fontSize: 13,
+                      color: _kBrutalistSecondaryText,
+                    ),
+                  ),
+                ],
               ),
-              SizedBox(height: 24),
-              Text(
-                'Initializing AI Engine...',
-                textAlign: TextAlign.center,
-                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
+              const Positioned(
+                bottom: 24,
+                child: Text(
+                  'v0.1.0-beta',
+                  textAlign: TextAlign.center,
+                  style: TextStyle(
+                    fontSize: 11,
+                    color: _kBrutalistSecondaryText,
+                    fontWeight: FontWeight.w400,
+                  ),
+                ),
               ),
             ],
           ),
@@ -608,7 +706,7 @@ class _StartupGateState extends ConsumerState<StartupGate> {
                 const SizedBox(height: 20),
                 Text(
                   _errorText ??
-                      'Failed to initialize the local engine. Please restart the application or check if port 8001 is in use.',
+                      'Failed to initialize the local engine. Please restart the application or check if port $_kBackendPort is in use.',
                   textAlign: TextAlign.center,
                   style: const TextStyle(
                     fontSize: 16,
@@ -632,7 +730,7 @@ class _FullScreenStartupOverlay extends StatelessWidget {
   @override
   Widget build(BuildContext context) {
     return Scaffold(
-      backgroundColor: _kBrutalistBackground,
+      backgroundColor: _kStartupBackground,
       body: Center(child: child),
     );
   }
@@ -777,10 +875,10 @@ class HomePage extends ConsumerStatefulWidget {
 
 class _HomePageState extends ConsumerState<HomePage> {
   static final Uri _scanBadgeUri = Uri.parse(
-    'http://127.0.0.1:8001/scan-badge',
+    '$backendBaseUrl/scan-badge',
   );
   static final Uri _processBatchUri = Uri.parse(
-    'http://127.0.0.1:8001/process-batch',
+    '$backendBaseUrl/process-batch',
   );
   static const Set<String> _scanFailureTokens = {
     'ERROR_READING_TEXT',
@@ -935,10 +1033,12 @@ class _HomePageState extends ConsumerState<HomePage> {
     });
 
     try {
+      debugPrint('Sending scan request to $_scanBadgeUri');
       final request = http.MultipartRequest('POST', _scanBadgeUri)
         ..files.add(await http.MultipartFile.fromPath('file', selectedPath));
       final streamedResponse = await request.send();
       final response = await http.Response.fromStream(streamedResponse);
+      debugPrint('Scan response ${response.statusCode}: ${response.body}');
 
       if (response.statusCode != 200) {
         throw HttpException(
@@ -982,7 +1082,7 @@ class _HomePageState extends ConsumerState<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'Could not scan image. Is FastAPI running on 127.0.0.1:8001?',
+            'Could not scan image. Is FastAPI running on $backendBaseUrl?',
           ),
         ),
       );
@@ -1010,11 +1110,13 @@ class _HomePageState extends ConsumerState<HomePage> {
 
     try {
       final payload = {'manifest': tags};
+      debugPrint('Sending batch request to $_processBatchUri');
       final response = await http.post(
         _processBatchUri,
         headers: {'Content-Type': 'application/json'},
         body: jsonEncode(payload),
       );
+      debugPrint('Batch response ${response.statusCode}: ${response.body}');
 
       if (response.statusCode != 200) {
         throw HttpException(
@@ -1038,7 +1140,7 @@ class _HomePageState extends ConsumerState<HomePage> {
       ScaffoldMessenger.of(context).showSnackBar(
         const SnackBar(
           content: Text(
-            'Batch processing failed. Is FastAPI running on 127.0.0.1:8001?',
+            'Batch processing failed. Is FastAPI running on $backendBaseUrl?',
           ),
         ),
       );

@@ -15,7 +15,7 @@ from PyInstaller.utils.hooks import collect_data_files
 block_cipher = None
 spec_dir = Path(SPECPATH).resolve()
 
-# CA bundle for Google APIs / gRPC over TLS in a frozen app
+# CA bundle for HTTPS clients in a frozen app
 datas = collect_data_files("certifi")
 
 hiddenimports = [
@@ -50,18 +50,6 @@ hiddenimports = [
     "pydantic",
     "pydantic.deprecated.decorator",
     "pydantic_core._pydantic_core",
-    # Google Cloud Vision (grpc + generated surface)
-    "google.cloud.vision",
-    "google.cloud.vision_v1",
-    "google.cloud.vision_v1.types",
-    "google.api_core",
-    "google.api_core.retry",
-    "google.auth",
-    "google.auth.transport",
-    "google.auth.transport.requests",
-    "google.oauth2.service_account",
-    "grpc",
-    "grpc._cython.cygrpc",
     # PyExifTool (import name is exiftool)
     "exiftool",
 ]

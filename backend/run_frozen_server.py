@@ -4,7 +4,7 @@ Entry point for the PyInstaller one-file Windows build.
 Uvicorn is started programmatically so the frozen app listens on 127.0.0.1:8001
 with no separate console process (build with windowed=True / --windowed).
 
-Import `app` at module scope so PyInstaller follows FastAPI, Vision, and ExifTool
+Import `app` at module scope so PyInstaller follows FastAPI, requests, and ExifTool
 dependencies. A string factory like ``\"app.main:app\"`` is not analyzed.
 """
 from __future__ import annotations
@@ -14,12 +14,12 @@ import os
 
 import uvicorn
 
-# Application object — pulls in FastAPI, Google Vision, PyExifTool, etc.
+# Application object — pulls in FastAPI, requests, PyExifTool, etc.
 from app.main import app as fastapi_app
 
 
 def _configure_ssl_cert_bundle() -> None:
-    """Ensure gRPC / google-auth can find CA certs inside a frozen bundle."""
+    """Ensure HTTPS clients can find CA certs inside a frozen bundle."""
     try:
         import certifi
     except ImportError:
