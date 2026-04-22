@@ -28,8 +28,14 @@ app.add_middleware(
 )
 
 @app.get("/")
-async def health_check():
+async def root():
     return {"status": "healthy", "service": "pr-metadata-bridge"}
+
+
+@app.get("/health")
+async def health():
+    """Lightweight liveness probe for the desktop client startup gate."""
+    return {"status": "ok"}
 
 @app.post("/process-batch")
 async def process_batch(payload: ProcessBatchRequest):

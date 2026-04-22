@@ -1,14 +1,178 @@
+import 'dart:async';
 import 'dart:convert';
 import 'dart:io';
 
 import 'package:file_picker/file_picker.dart';
+import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:path/path.dart' as p;
+import 'package:window_manager/window_manager.dart';
 
-void main() {
-  runApp(const ProviderScope(child: App()));
+const String _kBackendHost = '127.0.0.1';
+const int _kBackendPort = 8001;
+final Uri _kBackendHealthUri = Uri(
+  scheme: 'http',
+  host: _kBackendHost,
+  port: _kBackendPort,
+  path: '/health',
+);
+const Duration _kHealthPollInterval = Duration(seconds: 1);
+const Duration _kHealthWaitTimeout = Duration(seconds: 15);
+const Duration _kHealthRequestTimeout = Duration(seconds: 2);
+
+final backendHostProvider = ChangeNotifierProvider<BackendHostController>(
+  (ref) => throw StateError('backendHostProvider must be overridden in main()'),
+);
+
+Future<bool> isBackendPortAcceptingConnections() async {
+  Socket? socket;
+  try {
+    socket = await Socket.connect(
+      _kBackendHost,
+      _kBackendPort,
+      timeout: const Duration(seconds: 1),
+    );
+    return true;
+  } catch (_) {
+    return false;
+  } finally {
+    socket?.destroy();
+  }
+}
+
+/// Returns true once the FastAPI app responds with HTTP 200 on `/health`.
+Future<bool> pingBackendHealth() async {
+  try {
+    final response = await http
+        .get(_kBackendHealthUri)
+        .timeout(_kHealthRequestTimeout);
+    return response.statusCode == 200;
+  } catch (_) {
+    return false;
+  }
+}
+
+/// Owns the packaged `backend.exe` child process (Windows), port readiness,
+/// and cooperative shutdown when the desktop window closes.
+class BackendHostController extends ChangeNotifier {
+  Process? _process;
+  bool _ownsProcess = false;
+  bool _canSendHttp = false;
+  String? _bootstrapMessage;
+
+  bool get canSendHttp => _canSendHttp;
+
+  /// Shown when the backend is unavailable or failed to start.
+  String? get bootstrapMessage => _bootstrapMessage;
+
+  Future<void> bootstrap() async {
+    _canSendHttp = false;
+
+    if (!Platform.isWindows) {
+      _ownsProcess = false;
+      _bootstrapMessage = null;
+      notifyListeners();
+      return;
+    }
+
+    if (await isBackendPortAcceptingConnections()) {
+      _ownsProcess = false;
+      _bootstrapMessage = null;
+      notifyListeners();
+      return;
+    }
+
+    final exeDir = File(Platform.resolvedExecutable).parent.path;
+    final backendExe = p.join(exeDir, 'backend.exe');
+    if (!await File(backendExe).exists()) {
+      _bootstrapMessage =
+          'backend.exe was not found next to the application:\n$backendExe';
+      notifyListeners();
+      return;
+    }
+
+    try {
+      _process = await Process.start(
+        backendExe,
+        const <String>[],
+        workingDirectory: exeDir,
+        mode: ProcessStartMode.normal,
+      );
+      _ownsProcess = true;
+    } catch (e) {
+      _bootstrapMessage = 'Failed to start backend.exe: $e';
+      notifyListeners();
+      return;
+    }
+
+    _bootstrapMessage = null;
+    notifyListeners();
+  }
+
+  /// Polls [pingBackendHealth] until success or [_kHealthWaitTimeout] elapses.
+  Future<bool> waitForBackendHttpReady() async {
+    final deadline = DateTime.now().add(_kHealthWaitTimeout);
+    while (DateTime.now().isBefore(deadline)) {
+      if (await pingBackendHealth()) {
+        _canSendHttp = true;
+        _bootstrapMessage = null;
+        notifyListeners();
+        return true;
+      }
+      await Future<void>.delayed(_kHealthPollInterval);
+    }
+    _canSendHttp = false;
+    _bootstrapMessage =
+        'Failed to initialize the local engine. Please restart the application or check if port 8001 is in use.';
+    if (_ownsProcess) {
+      await shutdownOwned();
+    }
+    notifyListeners();
+    return false;
+  }
+
+  /// Stops [backend.exe] if this app started it (avoids killing a separately
+  /// launched dev server).
+  Future<void> shutdownOwned() async {
+    if (!_ownsProcess || _process == null) {
+      return;
+    }
+    final proc = _process!;
+    _process = null;
+    _ownsProcess = false;
+    try {
+      proc.kill(ProcessSignal.sigterm);
+    } catch (_) {
+      // Already exited.
+    }
+    try {
+      await proc.exitCode.timeout(const Duration(seconds: 5));
+    } on TimeoutException {
+      try {
+        proc.kill(ProcessSignal.sigkill);
+      } catch (_) {}
+    }
+  }
+}
+
+Future<void> main() async {
+  WidgetsFlutterBinding.ensureInitialized();
+
+  if (!kIsWeb && Platform.isWindows) {
+    await windowManager.ensureInitialized();
+    await windowManager.setPreventClose(true);
+  }
+
+  final backendHost = BackendHostController();
+
+  runApp(
+    ProviderScope(
+      overrides: [backendHostProvider.overrideWith((ref) => backendHost)],
+      child: const App(),
+    ),
+  );
 }
 
 class ImagePathsNotifier extends StateNotifier<List<String>> {
@@ -25,13 +189,14 @@ class ImagePathsNotifier extends StateNotifier<List<String>> {
     }
 
     final directory = Directory(selectedDirectory);
-    final files = directory
-        .listSync()
-        .whereType<File>()
-        .where((file) => _isJpeg(file.path))
-        .map((file) => _normalizePath(file.path))
-        .toList()
-      ..sort();
+    final files =
+        directory
+            .listSync()
+            .whereType<File>()
+            .where((file) => _isJpeg(file.path))
+            .map((file) => _normalizePath(file.path))
+            .toList()
+          ..sort();
 
     state = files;
   }
@@ -95,26 +260,64 @@ class TagsNotifier extends StateNotifier<Map<String, String>> {
   }
 }
 
-final loadedFilesProvider = StateNotifierProvider<ImagePathsNotifier, List<String>>(
-  (ref) => ImagePathsNotifier(),
-);
+final loadedFilesProvider =
+    StateNotifierProvider<ImagePathsNotifier, List<String>>(
+      (ref) => ImagePathsNotifier(),
+    );
 
 final selectedFilesProvider =
     StateNotifierProvider<SelectedImagesNotifier, Set<String>>(
       (ref) => SelectedImagesNotifier(),
     );
 
-final taggedFilesProvider = StateNotifierProvider<TagsNotifier, Map<String, String>>(
-  (ref) => TagsNotifier(),
-);
+final taggedFilesProvider =
+    StateNotifierProvider<TagsNotifier, Map<String, String>>(
+      (ref) => TagsNotifier(),
+    );
 
 // Backward-compatible aliases for existing references.
 final imagePathsProvider = loadedFilesProvider;
 final selectedImagesProvider = selectedFilesProvider;
 final tagsProvider = taggedFilesProvider;
 
-class App extends StatelessWidget {
+class App extends ConsumerStatefulWidget {
   const App({super.key});
+
+  @override
+  ConsumerState<App> createState() => _AppState();
+}
+
+class _AppState extends ConsumerState<App> with WindowListener {
+  static bool get _manageWindowClose => !kIsWeb && Platform.isWindows;
+
+  @override
+  void initState() {
+    super.initState();
+    if (_manageWindowClose) {
+      windowManager.addListener(this);
+    }
+  }
+
+  @override
+  void dispose() {
+    if (_manageWindowClose) {
+      windowManager.removeListener(this);
+    }
+    super.dispose();
+  }
+
+  @override
+  void onWindowClose() {
+    if (!_manageWindowClose) {
+      return;
+    }
+    unawaited(_shutdownBackendAndCloseWindow());
+  }
+
+  Future<void> _shutdownBackendAndCloseWindow() async {
+    await ref.read(backendHostProvider).shutdownOwned();
+    await windowManager.destroy();
+  }
 
   @override
   Widget build(BuildContext context) {
@@ -122,7 +325,128 @@ class App extends StatelessWidget {
       debugShowCheckedModeBanner: false,
       title: 'VIP Tagger',
       theme: ThemeData.dark(),
-      home: const HomePage(),
+      home: const StartupGate(child: HomePage()),
+    );
+  }
+}
+
+enum _StartupGatePhase { loading, ready, error }
+
+/// Runs [BackendHostController.bootstrap], then HTTP health polling before
+/// revealing [child].
+class StartupGate extends ConsumerStatefulWidget {
+  const StartupGate({required this.child, super.key});
+
+  final Widget child;
+
+  @override
+  ConsumerState<StartupGate> createState() => _StartupGateState();
+}
+
+class _StartupGateState extends ConsumerState<StartupGate> {
+  _StartupGatePhase _phase = _StartupGatePhase.loading;
+  String? _errorText;
+
+  @override
+  void initState() {
+    super.initState();
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      unawaited(_runStartup());
+    });
+  }
+
+  Future<void> _runStartup() async {
+    final backend = ref.read(backendHostProvider);
+    await backend.bootstrap();
+
+    if (!mounted) {
+      return;
+    }
+
+    if (backend.bootstrapMessage != null) {
+      setState(() {
+        _phase = _StartupGatePhase.error;
+        _errorText = backend.bootstrapMessage;
+      });
+      return;
+    }
+
+    final ok = await backend.waitForBackendHttpReady();
+    if (!mounted) {
+      return;
+    }
+
+    if (ok) {
+      setState(() => _phase = _StartupGatePhase.ready);
+    } else {
+      setState(() {
+        _phase = _StartupGatePhase.error;
+        _errorText = backend.bootstrapMessage;
+      });
+    }
+  }
+
+  @override
+  Widget build(BuildContext context) {
+    switch (_phase) {
+      case _StartupGatePhase.ready:
+        return widget.child;
+      case _StartupGatePhase.loading:
+        return const _FullScreenStartupOverlay(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 48,
+                height: 48,
+                child: CircularProgressIndicator(strokeWidth: 3),
+              ),
+              SizedBox(height: 24),
+              Text(
+                'Initializing AI Engine...',
+                textAlign: TextAlign.center,
+                style: TextStyle(fontSize: 18, fontWeight: FontWeight.w500),
+              ),
+            ],
+          ),
+        );
+      case _StartupGatePhase.error:
+        return _FullScreenStartupOverlay(
+          child: Padding(
+            padding: const EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                const Icon(Icons.error_outline, color: Colors.redAccent, size: 56),
+                const SizedBox(height: 20),
+                Text(
+                  _errorText ??
+                      'Failed to initialize the local engine. Please restart the application or check if port 8001 is in use.',
+                  textAlign: TextAlign.center,
+                  style: const TextStyle(
+                    fontSize: 16,
+                    height: 1.4,
+                    color: Colors.white70,
+                  ),
+                ),
+              ],
+            ),
+          ),
+        );
+    }
+  }
+}
+
+class _FullScreenStartupOverlay extends StatelessWidget {
+  const _FullScreenStartupOverlay({required this.child});
+
+  final Widget child;
+
+  @override
+  Widget build(BuildContext context) {
+    return Scaffold(
+      backgroundColor: const Color(0xFF12131A),
+      body: Center(child: child),
     );
   }
 }
@@ -135,7 +459,9 @@ class HomePage extends ConsumerStatefulWidget {
 }
 
 class _HomePageState extends ConsumerState<HomePage> {
-  static final Uri _scanBadgeUri = Uri.parse('http://127.0.0.1:8001/scan-badge');
+  static final Uri _scanBadgeUri = Uri.parse(
+    'http://127.0.0.1:8001/scan-badge',
+  );
   static final Uri _processBatchUri = Uri.parse(
     'http://127.0.0.1:8001/process-batch',
   );
@@ -215,7 +541,9 @@ class _HomePageState extends ConsumerState<HomePage> {
 
       final decodedBody = jsonDecode(response.body);
       if (decodedBody is! Map<String, dynamic>) {
-        throw const FormatException('Unexpected JSON response from scan endpoint');
+        throw const FormatException(
+          'Unexpected JSON response from scan endpoint',
+        );
       }
 
       final raw = decodedBody['extracted_text'];
@@ -263,9 +591,9 @@ class _HomePageState extends ConsumerState<HomePage> {
   Future<void> _processBatch() async {
     final tags = ref.read(taggedFilesProvider);
     if (tags.isEmpty) {
-      ScaffoldMessenger.of(
-        context,
-      ).showSnackBar(const SnackBar(content: Text('No tagged images to process.')));
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(content: Text('No tagged images to process.')),
+      );
       return;
     }
 
@@ -321,207 +649,244 @@ class _HomePageState extends ConsumerState<HomePage> {
     final imagePaths = ref.watch(loadedFilesProvider);
     final selected = ref.watch(selectedFilesProvider);
     final tags = ref.watch(taggedFilesProvider);
+    final backend = ref.watch(backendHostProvider);
     const sidebarColor = Color(0xFF1E1F24);
     const contentColor = Color(0xFF272932);
 
     return Scaffold(
-      body: Row(
+      body: Column(
+        crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
-          Container(
-            width: _leftSidebarWidth,
-            color: sidebarColor,
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                ElevatedButton(
-                  onPressed:
-                      () async => ref
-                          .read(loadedFilesProvider.notifier)
-                          .pickFolderAndLoadJpegs(),
-                  style: ElevatedButton.styleFrom(
-                    padding: const EdgeInsets.symmetric(vertical: 16),
-                  ),
-                  child: const Text('Select Folder'),
+          if (!backend.canSendHttp)
+            Material(
+              color: Colors.amber.shade900,
+              child: Padding(
+                padding: const EdgeInsets.symmetric(
+                  horizontal: 16,
+                  vertical: 12,
                 ),
-                const SizedBox(height: 16),
-                Expanded(
-                  child: ListView.separated(
-                    itemCount: imagePaths.length,
-                    separatorBuilder: (_, _) => const Divider(height: 1),
-                    itemBuilder: (context, index) {
-                      final filePath = imagePaths[index];
-                      final isSelected = selected.contains(filePath);
-                      return ListTile(
-                        dense: true,
-                        title: Text(
-                          p.basename(filePath),
-                          maxLines: 1,
-                          overflow: TextOverflow.ellipsis,
-                        ),
-                        selected: isSelected,
-                        onTap:
-                            () => ref
-                                .read(selectedFilesProvider.notifier)
-                                .toggle(filePath),
-                      );
-                    },
-                  ),
+                child: Text(
+                  backend.bootstrapMessage ??
+                      'Backend is not ready on $_kBackendHost:$_kBackendPort. '
+                          'Scan and batch actions are disabled.',
+                  style: const TextStyle(color: Colors.black87),
                 ),
-              ],
+              ),
             ),
-          ),
           Expanded(
-            child: Container(
-              color: contentColor,
-              padding: const EdgeInsets.all(16),
-              child:
-                  imagePaths.isEmpty
-                      ? const Center(
-                        child: Text(
-                          'No JPEG files loaded',
-                          style: TextStyle(fontSize: 18),
+            child: Row(
+              children: [
+                Container(
+                  width: _leftSidebarWidth,
+                  color: sidebarColor,
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      ElevatedButton(
+                        onPressed: () async => ref
+                            .read(loadedFilesProvider.notifier)
+                            .pickFolderAndLoadJpegs(),
+                        style: ElevatedButton.styleFrom(
+                          padding: const EdgeInsets.symmetric(vertical: 16),
                         ),
-                      )
-                      : GridView.builder(
-                        gridDelegate:
-                            const SliverGridDelegateWithMaxCrossAxisExtent(
-                              maxCrossAxisExtent: 260,
-                              childAspectRatio: 0.95,
-                              crossAxisSpacing: 12,
-                              mainAxisSpacing: 12,
+                        child: const Text('Select Folder'),
+                      ),
+                      const SizedBox(height: 16),
+                      Expanded(
+                        child: ListView.separated(
+                          itemCount: imagePaths.length,
+                          separatorBuilder: (_, _) => const Divider(height: 1),
+                          itemBuilder: (context, index) {
+                            final filePath = imagePaths[index];
+                            final isSelected = selected.contains(filePath);
+                            return ListTile(
+                              dense: true,
+                              title: Text(
+                                p.basename(filePath),
+                                maxLines: 1,
+                                overflow: TextOverflow.ellipsis,
+                              ),
+                              selected: isSelected,
+                              onTap: () => ref
+                                  .read(selectedFilesProvider.notifier)
+                                  .toggle(filePath),
+                            );
+                          },
+                        ),
+                      ),
+                    ],
+                  ),
+                ),
+                Expanded(
+                  child: Container(
+                    color: contentColor,
+                    padding: const EdgeInsets.all(16),
+                    child: imagePaths.isEmpty
+                        ? const Center(
+                            child: Text(
+                              'No JPEG files loaded',
+                              style: TextStyle(fontSize: 18),
                             ),
-                        itemCount: imagePaths.length,
-                        itemBuilder: (context, index) {
-                          final filePath = imagePaths[index];
-                          final fileName = p.basename(filePath);
-                          final isSelected = selected.contains(filePath);
-                          final assignedTag = tags[filePath];
+                          )
+                        : GridView.builder(
+                            gridDelegate:
+                                const SliverGridDelegateWithMaxCrossAxisExtent(
+                                  maxCrossAxisExtent: 260,
+                                  childAspectRatio: 0.95,
+                                  crossAxisSpacing: 12,
+                                  mainAxisSpacing: 12,
+                                ),
+                            itemCount: imagePaths.length,
+                            itemBuilder: (context, index) {
+                              final filePath = imagePaths[index];
+                              final fileName = p.basename(filePath);
+                              final isSelected = selected.contains(filePath);
+                              final assignedTag = tags[filePath];
 
-                          return InkWell(
-                            onTap:
-                                () => ref
+                              return InkWell(
+                                onTap: () => ref
                                     .read(selectedFilesProvider.notifier)
                                     .toggle(filePath),
-                            child: Container(
-                              decoration: BoxDecoration(
-                                color: const Color(0xFF1B1D24),
-                                borderRadius: BorderRadius.circular(8),
-                                border: Border.all(
-                                  color:
-                                      isSelected
+                                child: Container(
+                                  decoration: BoxDecoration(
+                                    color: const Color(0xFF1B1D24),
+                                    borderRadius: BorderRadius.circular(8),
+                                    border: Border.all(
+                                      color: isSelected
                                           ? const Color(0xFF1EA7FF)
                                           : Colors.white24,
-                                  width: isSelected ? 3 : 1,
-                                ),
-                              ),
-                              padding: const EdgeInsets.all(8),
-                              child: Column(
-                                crossAxisAlignment: CrossAxisAlignment.start,
-                                children: [
-                                  Expanded(
-                                    child: ClipRRect(
-                                      borderRadius: BorderRadius.circular(6),
-                                      child: Image.file(
-                                        File(filePath),
-                                        fit: BoxFit.cover,
-                                        width: double.infinity,
-                                        errorBuilder:
-                                            (_, _, _) => Container(
-                                              color: Colors.black38,
-                                              alignment: Alignment.center,
-                                              child: const Text('Preview N/A'),
-                                            ),
-                                      ),
+                                      width: isSelected ? 3 : 1,
                                     ),
                                   ),
-                                  const SizedBox(height: 8),
-                                  Text(
-                                    fileName,
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
+                                  padding: const EdgeInsets.all(8),
+                                  child: Column(
+                                    crossAxisAlignment:
+                                        CrossAxisAlignment.start,
+                                    children: [
+                                      Expanded(
+                                        child: ClipRRect(
+                                          borderRadius: BorderRadius.circular(
+                                            6,
+                                          ),
+                                          child: Image.file(
+                                            File(filePath),
+                                            fit: BoxFit.cover,
+                                            width: double.infinity,
+                                            errorBuilder: (_, _, _) =>
+                                                Container(
+                                                  color: Colors.black38,
+                                                  alignment: Alignment.center,
+                                                  child: const Text(
+                                                    'Preview N/A',
+                                                  ),
+                                                ),
+                                          ),
+                                        ),
+                                      ),
+                                      const SizedBox(height: 8),
+                                      Text(
+                                        fileName,
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                      ),
+                                      Text(
+                                        assignedTag == null
+                                            ? 'Tag: (none)'
+                                            : 'Tag: $assignedTag',
+                                        maxLines: 1,
+                                        overflow: TextOverflow.ellipsis,
+                                        style: const TextStyle(
+                                          color: Colors.white70,
+                                        ),
+                                      ),
+                                    ],
                                   ),
-                                  Text(
-                                    assignedTag == null
-                                        ? 'Tag: (none)'
-                                        : 'Tag: $assignedTag',
-                                    maxLines: 1,
-                                    overflow: TextOverflow.ellipsis,
-                                    style: const TextStyle(color: Colors.white70),
-                                  ),
-                                ],
-                              ),
-                            ),
-                          );
-                        },
-                      ),
-            ),
-          ),
-          Container(
-            width: _rightSidebarWidth,
-            color: sidebarColor,
-            padding: const EdgeInsets.all(16),
-            child: Column(
-              crossAxisAlignment: CrossAxisAlignment.stretch,
-              children: [
-                const Text(
-                  'Anchor Scanner',
-                  style: TextStyle(fontSize: 18, fontWeight: FontWeight.bold),
-                ),
-                const SizedBox(height: 16),
-                ElevatedButton(
-                  onPressed:
-                      selected.isEmpty || _isScanning ? null : _scanSelectedAnchorPhoto,
-                  child:
-                      _isScanning
-                          ? const SizedBox(
-                            height: 18,
-                            width: 18,
-                            child: CircularProgressIndicator(strokeWidth: 2),
-                          )
-                          : const Text('Scan Selected Anchor Photo'),
-                ),
-                const SizedBox(height: 12),
-                TextField(
-                  controller: _tagController,
-                  decoration: const InputDecoration(
-                    labelText: 'VIP Name',
-                    border: OutlineInputBorder(),
+                                ),
+                              );
+                            },
+                          ),
                   ),
                 ),
-                const SizedBox(height: 12),
-                ElevatedButton(
-                  onPressed: _assignTag,
-                  child: const Text('Assign Name to Selected'),
-                ),
-                const SizedBox(height: 16),
-                const Divider(),
-                const SizedBox(height: 8),
-                Text(
-                  'Loaded: ${imagePaths.length}  Selected: ${selected.length}  Tagged: ${tags.length}',
-                  style: const TextStyle(color: Colors.white70),
-                ),
-                const Spacer(),
-                SizedBox(
-                  height: 64,
-                  child: ElevatedButton(
-                    onPressed: _isProcessingBatch ? null : _process,
-                    style: ElevatedButton.styleFrom(
-                      backgroundColor: const Color(0xFF1EA7FF),
-                      foregroundColor: Colors.black,
-                      textStyle: const TextStyle(
-                        fontSize: 20,
-                        fontWeight: FontWeight.w700,
+                Container(
+                  width: _rightSidebarWidth,
+                  color: sidebarColor,
+                  padding: const EdgeInsets.all(16),
+                  child: Column(
+                    crossAxisAlignment: CrossAxisAlignment.stretch,
+                    children: [
+                      const Text(
+                        'Anchor Scanner',
+                        style: TextStyle(
+                          fontSize: 18,
+                          fontWeight: FontWeight.bold,
+                        ),
                       ),
-                    ),
-                    child:
-                        _isProcessingBatch
+                      const SizedBox(height: 16),
+                      ElevatedButton(
+                        onPressed:
+                            selected.isEmpty ||
+                                _isScanning ||
+                                !backend.canSendHttp
+                            ? null
+                            : _scanSelectedAnchorPhoto,
+                        child: _isScanning
                             ? const SizedBox(
-                              height: 24,
-                              width: 24,
-                              child: CircularProgressIndicator(strokeWidth: 3),
-                            )
-                            : const Text('Process Batch'),
+                                height: 18,
+                                width: 18,
+                                child: CircularProgressIndicator(
+                                  strokeWidth: 2,
+                                ),
+                              )
+                            : const Text('Scan Selected Anchor Photo'),
+                      ),
+                      const SizedBox(height: 12),
+                      TextField(
+                        controller: _tagController,
+                        decoration: const InputDecoration(
+                          labelText: 'VIP Name',
+                          border: OutlineInputBorder(),
+                        ),
+                      ),
+                      const SizedBox(height: 12),
+                      ElevatedButton(
+                        onPressed: _assignTag,
+                        child: const Text('Assign Name to Selected'),
+                      ),
+                      const SizedBox(height: 16),
+                      const Divider(),
+                      const SizedBox(height: 8),
+                      Text(
+                        'Loaded: ${imagePaths.length}  Selected: ${selected.length}  Tagged: ${tags.length}',
+                        style: const TextStyle(color: Colors.white70),
+                      ),
+                      const Spacer(),
+                      SizedBox(
+                        height: 64,
+                        child: ElevatedButton(
+                          onPressed: _isProcessingBatch || !backend.canSendHttp
+                              ? null
+                              : _process,
+                          style: ElevatedButton.styleFrom(
+                            backgroundColor: const Color(0xFF1EA7FF),
+                            foregroundColor: Colors.black,
+                            textStyle: const TextStyle(
+                              fontSize: 20,
+                              fontWeight: FontWeight.w700,
+                            ),
+                          ),
+                          child: _isProcessingBatch
+                              ? const SizedBox(
+                                  height: 24,
+                                  width: 24,
+                                  child: CircularProgressIndicator(
+                                    strokeWidth: 3,
+                                  ),
+                                )
+                              : const Text('Process Batch'),
+                        ),
+                      ),
+                    ],
                   ),
                 ),
               ],
