@@ -10,6 +10,7 @@ import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:http_parser/http_parser.dart';
 import 'package:path/path.dart' as p;
+import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 
 late final String backendBaseUrl;
@@ -325,6 +326,10 @@ class ImagePathsNotifier extends StateNotifier<List<String>> {
 
   String _normalizePath(String rawPath) => p.normalize(rawPath);
 
+  /// Last folder passed to [loadJpegsFromDirectory], used for refresh and breadcrumb.
+  String? get currentLoadDirectory => _currentLoadDirectory;
+  String? _currentLoadDirectory;
+
   Future<bool> pickFolderAndLoadJpegs() async {
     final selectedDirectory = await FilePicker.platform.getDirectoryPath(
       dialogTitle: 'Select Folder with JPEG Images',
@@ -338,7 +343,8 @@ class ImagePathsNotifier extends StateNotifier<List<String>> {
   }
 
   void loadJpegsFromDirectory(String selectedDirectory) {
-    final directory = Directory(selectedDirectory);
+    _currentLoadDirectory = _normalizePath(selectedDirectory);
+    final directory = Directory(_currentLoadDirectory!);
     final files =
         directory
             .listSync()
@@ -357,6 +363,7 @@ class ImagePathsNotifier extends StateNotifier<List<String>> {
   }
 
   void clear() {
+    _currentLoadDirectory = null;
     state = const [];
   }
 }
@@ -379,6 +386,14 @@ class SelectedImagesNotifier extends StateNotifier<Set<String>> {
 
   void clear() {
     state = <String>{};
+  }
+
+  void keepOnlyPaths(Set<String> validPaths) {
+    final next = {for (final p in state) if (validPaths.contains(p)) p};
+    if (next.length == state.length) {
+      return;
+    }
+    state = next;
   }
 }
 
@@ -411,6 +426,17 @@ class TagsNotifier extends StateNotifier<Map<String, String>> {
 
   void clear() {
     state = <String, String>{};
+  }
+
+  void keepOnlyPathsWithTags(Set<String> validPaths) {
+    final next = {
+      for (final e in state.entries)
+        if (validPaths.contains(e.key)) e.key: e.value,
+    };
+    if (next.length == state.length) {
+      return;
+    }
+    state = next;
   }
 }
 
@@ -986,22 +1012,34 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   void _assignTag() {
+    // Always use the live field text at tap time, never a stale scan/OCR value.
+    final subjectFromField = _tagController.text;
     final selectedPaths = ref.read(selectedFilesProvider);
-    final vipName = _tagController.text;
     ref
         .read(taggedFilesProvider.notifier)
-        .assignTagToSelection(selectedPaths: selectedPaths, vipName: vipName);
+        .assignTagToSelection(
+          selectedPaths: selectedPaths,
+          vipName: subjectFromField,
+        );
   }
 
   void _process() {
     _processBatch();
   }
 
-  String? _activeFolderBreadcrumb(List<String> imagePaths) {
-    if (imagePaths.isEmpty) {
+  String? _activeFolderBreadcrumb(
+    List<String> imagePaths,
+    String? currentLoadDirectory,
+  ) {
+    String? rawFolder;
+    if (imagePaths.isNotEmpty) {
+      rawFolder = p.dirname(imagePaths.first);
+    } else if (currentLoadDirectory != null && currentLoadDirectory.isNotEmpty) {
+      rawFolder = currentLoadDirectory;
+    } else {
       return null;
     }
-    var folderPath = p.normalize(p.dirname(imagePaths.first));
+    var folderPath = p.normalize(rawFolder);
     final homePath =
         Platform.environment['USERPROFILE'] ?? Platform.environment['HOME'];
     if (homePath != null && homePath.isNotEmpty) {
@@ -1014,6 +1052,35 @@ class _HomePageState extends ConsumerState<HomePage> {
       folderPath = '$folderPath${p.separator}';
     }
     return folderPath.replaceAll('\\', '/');
+  }
+
+  void _refreshCurrentFolder() {
+    final dir = ref.read(loadedFilesProvider.notifier).currentLoadDirectory;
+    if (dir == null) {
+      return;
+    }
+    ref.read(loadedFilesProvider.notifier).loadJpegsFromDirectory(dir);
+    final valid = ref.read(loadedFilesProvider).toSet();
+    ref.read(selectedFilesProvider.notifier).keepOnlyPaths(valid);
+    ref.read(taggedFilesProvider.notifier).keepOnlyPathsWithTags(valid);
+  }
+
+  Future<void> _openBetaFeedbackEmail() async {
+    final uri = Uri(
+      scheme: 'mailto',
+      path: 'ed.ddios0210@gmail.com',
+      queryParameters: const <String, String>{
+        'subject': 'CaptionFast Beta Feedback',
+      },
+    );
+    if (!await canLaunchUrl(uri)) {
+      if (!mounted) {
+        return;
+      }
+      _showErrorSnackBar('Could not open an email app.');
+      return;
+    }
+    await launchUrl(uri);
   }
 
   void _clearCurrentSelectionAndTags() {
@@ -1280,6 +1347,8 @@ class _HomePageState extends ConsumerState<HomePage> {
     final selected = ref.watch(selectedFilesProvider);
     final tags = ref.watch(taggedFilesProvider);
     final backend = ref.watch(backendHostProvider);
+    final currentLoadDirectory =
+        ref.read(loadedFilesProvider.notifier).currentLoadDirectory;
 
     return Scaffold(
       body: Column(
@@ -1318,8 +1387,10 @@ class _HomePageState extends ConsumerState<HomePage> {
                             Expanded(
                               child: Builder(
                                 builder: (context) {
-                                  final breadcrumb =
-                                      _activeFolderBreadcrumb(imagePaths);
+                                  final breadcrumb = _activeFolderBreadcrumb(
+                                    imagePaths,
+                                    currentLoadDirectory,
+                                  );
                                   if (breadcrumb == null) {
                                     return const SizedBox.shrink();
                                   }
@@ -1349,6 +1420,25 @@ class _HomePageState extends ConsumerState<HomePage> {
                                   );
                                 },
                               ),
+                            ),
+                            if (currentLoadDirectory != null)
+                              IconButton(
+                                icon: const Icon(
+                                  Icons.refresh,
+                                  size: 20,
+                                  color: _kBrutalistSecondaryText,
+                                ),
+                                tooltip: 'Refresh folder',
+                                onPressed: _refreshCurrentFolder,
+                              ),
+                            IconButton(
+                              icon: const Icon(
+                                Icons.bug_report,
+                                size: 20,
+                                color: _kBrutalistSecondaryText,
+                              ),
+                              tooltip: 'Report bug',
+                              onPressed: _openBetaFeedbackEmail,
                             ),
                           ],
                         ),
