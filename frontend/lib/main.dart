@@ -13,7 +13,6 @@ import 'package:path/path.dart' as p;
 import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 
-late final String backendBaseUrl;
 late final String _kBackendHost;
 late final int _kBackendPort;
 late final Uri _kProxyScanUri;
@@ -81,7 +80,6 @@ void _initializeBackendConfigFromEnv() {
     host: parsedBaseUri.host,
     port: parsedBaseUri.hasPort ? parsedBaseUri.port : null,
   );
-  backendBaseUrl = origin.toString().replaceFirst(RegExp(r'/+$'), '');
   _kBackendHost = parsedBaseUri.host;
   _kBackendPort = parsedBaseUri.hasPort
       ? parsedBaseUri.port
@@ -460,19 +458,51 @@ final imagePathsProvider = loadedFilesProvider;
 final selectedImagesProvider = selectedFilesProvider;
 final tagsProvider = taggedFilesProvider;
 
-Map<String, String> _jsonHeadersWithApiKey() {
-  final headers = <String, String>{'Content-Type': 'application/json'};
-  if (_kProxyApiKey.isNotEmpty) {
-    headers['X-API-Key'] = _kProxyApiKey;
-  }
-  return headers;
-}
-
 Map<String, String> _authHeadersWithApiKey() {
   if (_kProxyApiKey.isEmpty) {
     return const <String, String>{};
   }
   return <String, String>{'X-API-Key': _kProxyApiKey};
+}
+
+/// Resolves the ExifTool binary: in debug, prefer [project root]/exiftool(.exe)
+/// or fall back to `exiftool` on PATH. In release, strictly next to the app
+/// (Windows `.exe`, Unix `exiftool` with macOS [Resources] fallback).
+Future<String> _resolveExifToolPath() async {
+  if (kDebugMode) {
+    final cwd = Directory.current.path;
+    if (Platform.isWindows) {
+      final inRoot = p.join(cwd, 'exiftool.exe');
+      if (await File(inRoot).exists()) {
+        return inRoot;
+      }
+    } else {
+      final inRoot = p.join(cwd, 'exiftool');
+      if (await File(inRoot).exists()) {
+        return inRoot;
+      }
+    }
+    return 'exiftool';
+  }
+
+  final exeParent = File(Platform.resolvedExecutable).parent.path;
+  if (Platform.isWindows) {
+    return p.join(exeParent, 'exiftool.exe');
+  }
+  if (Platform.isMacOS) {
+    final nextTo = p.join(exeParent, 'exiftool');
+    if (await File(nextTo).exists()) {
+      return nextTo;
+    }
+    final inResources = p.normalize(
+      p.join(exeParent, '..', 'Resources', 'exiftool'),
+    );
+    if (await File(inResources).exists()) {
+      return inResources;
+    }
+    return nextTo;
+  }
+  return p.join(exeParent, 'exiftool');
 }
 
 class App extends ConsumerStatefulWidget {
@@ -982,9 +1012,6 @@ class HomePage extends ConsumerStatefulWidget {
 
 class _HomePageState extends ConsumerState<HomePage> {
   static Uri get _scanUri => _kProxyScanUri;
-  static final Uri _processBatchUri = Uri.parse(
-    '$backendBaseUrl/process-batch',
-  );
   static const Set<String> _scanFailureTokens = {
     'ERROR_READING_TEXT',
     'SERVER_ERROR',
@@ -1288,50 +1315,81 @@ class _HomePageState extends ConsumerState<HomePage> {
       return;
     }
 
+    final subject = _tagController.text;
+    if (subject.trim().isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('Enter a subject name in the field before processing.'),
+        ),
+      );
+      return;
+    }
+
     setState(() {
       _isProcessingBatch = true;
     });
 
+    final paths = tags.keys.toList()..sort();
     try {
-      final payload = {'manifest': tags};
-      debugPrint('Sending batch request to $_processBatchUri');
-      final response = await http.post(
-        _processBatchUri,
-        headers: _jsonHeadersWithApiKey(),
-        body: jsonEncode(payload),
-      );
-      debugPrint('Batch response ${response.statusCode}: ${response.body}');
+      final exifPath = await _resolveExifToolPath();
+      var allSucceeded = true;
+      for (final filePath in paths) {
+        if (!mounted) {
+          return;
+        }
 
-      if (response.statusCode != 200) {
-        throw Exception(
-          'statusCode=${response.statusCode}, body=${response.body}',
+        final args = <String>[
+          '-Subject=$subject',
+          '-Keywords=$subject',
+          '-overwrite_original',
+          filePath,
+        ];
+
+        try {
+          final result = await Process.run(
+            exifPath,
+            args,
+          );
+          if (result.exitCode != 0) {
+            allSucceeded = false;
+            final err = result.stderr.toString();
+            debugPrint(
+              'ExifTool failed for $filePath (exit ${result.exitCode}): $err',
+            );
+            if (mounted) {
+              _showErrorSnackBar(
+                '${p.basename(filePath)}: ${err.trim().isEmpty ? "ExifTool failed" : err.trim()}',
+              );
+            }
+          }
+        } on ProcessException {
+          if (mounted) {
+            ScaffoldMessenger.of(context).showSnackBar(
+              const SnackBar(
+                content: Text(
+                  'ExifTool binary not found in installation directory.',
+                ),
+                backgroundColor: Colors.red,
+                behavior: SnackBarBehavior.floating,
+              ),
+            );
+          }
+          return;
+        }
+      }
+
+      if (!mounted) {
+        return;
+      }
+
+      if (allSucceeded) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(content: Text('Metadata injected successfully!')),
         );
+        _clearCurrentSelectionAndTags();
+        ref.read(taggedFilesProvider.notifier).clear();
+        _showProcessSuccessState();
       }
-
-      if (!mounted) {
-        return;
-      }
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('Metadata injected successfully!')),
-      );
-      _clearCurrentSelectionAndTags();
-      ref.read(taggedFilesProvider.notifier).clear();
-      _showProcessSuccessState();
-    } on SocketException {
-      if (!mounted) {
-        return;
-      }
-      _showErrorSnackBar('Connection refused.');
-    } on http.ClientException {
-      if (!mounted) {
-        return;
-      }
-      _showErrorSnackBar('Connection refused.');
-    } catch (error) {
-      if (!mounted) {
-        return;
-      }
-      _showErrorSnackBar(error.toString());
     } finally {
       if (mounted) {
         setState(() {
@@ -1750,9 +1808,8 @@ class _HomePageState extends ConsumerState<HomePage> {
                           child: SizedBox(
                             height: 70,
                             child: _PrimaryActionButton(
-                              onPressed: _isProcessingBatch || !backend.canSendHttp
-                                  ? null
-                                  : _process,
+                              onPressed:
+                                  _isProcessingBatch ? null : _process,
                               padding: const EdgeInsets.symmetric(vertical: 20),
                               child: _isProcessingBatch
                                   ? const SizedBox(
