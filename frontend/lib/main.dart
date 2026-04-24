@@ -5,20 +5,20 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
+import 'package:flutter_dotenv/flutter_dotenv.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
+import 'package:http_parser/http_parser.dart';
 import 'package:path/path.dart' as p;
 import 'package:window_manager/window_manager.dart';
 
-const String backendBaseUrl = "http://127.0.0.1:8003";
-const String _kBackendHost = '127.0.0.1';
-const int _kBackendPort = 8003;
-final Uri _kBackendHealthUri = Uri(
-  scheme: 'http',
-  host: _kBackendHost,
-  port: _kBackendPort,
-  path: '/health',
-);
+late final String backendBaseUrl;
+late final String _kBackendHost;
+late final int _kBackendPort;
+late final Uri _kProxyScanUri;
+late final Uri _kBackendHealthUri;
+late final bool _kSkipHealthCheck;
+late final String _kProxyApiKey;
 const Duration _kHealthPollInterval = Duration(seconds: 1);
 const Duration _kHealthWaitTimeout = Duration(seconds: 15);
 const Duration _kHealthRequestTimeout = Duration(seconds: 2);
@@ -40,6 +40,55 @@ const double _kPanelTitleFontSize = 18;
 final backendHostProvider = ChangeNotifierProvider<BackendHostController>(
   (ref) => throw StateError('backendHostProvider must be overridden in main()'),
 );
+
+Never _fatalEnvMissing([Object? cause]) {
+  final details = cause == null ? '' : '\nCause: $cause';
+  throw StateError(
+    'ENV FILE MISSING\n'
+    'ENV FILE MISSING\n'
+    'ENV FILE MISSING\n'
+    'Missing required dotenv configuration. '
+    'Expected dotenv.env[\'PROXY_URL\'] to be present.$details',
+  );
+}
+
+void _initializeBackendConfigFromEnv() {
+  final proxyUrl = dotenv.env['PROXY_URL']?.trim();
+  if (proxyUrl == null || proxyUrl.isEmpty) {
+    _fatalEnvMissing('PROXY_URL is null or empty.');
+  }
+
+  final parsedBaseUri = Uri.tryParse(proxyUrl);
+  if (parsedBaseUri == null ||
+      !parsedBaseUri.hasScheme ||
+      parsedBaseUri.host.isEmpty) {
+    _fatalEnvMissing('PROXY_URL is not a valid absolute URL: $proxyUrl');
+  }
+  final scheme = parsedBaseUri.scheme.toLowerCase();
+  final host = parsedBaseUri.host.toLowerCase();
+  final isLocalHost =
+      host == 'localhost' || host == '127.0.0.1' || host == '::1';
+  if (scheme != 'https' && !isLocalHost) {
+    _fatalEnvMissing(
+      'PROXY_URL must use https for non-local endpoints. Got: $proxyUrl',
+    );
+  }
+
+  _kProxyScanUri = parsedBaseUri.replace(queryParameters: const {});
+  final origin = Uri(
+    scheme: parsedBaseUri.scheme,
+    host: parsedBaseUri.host,
+    port: parsedBaseUri.hasPort ? parsedBaseUri.port : null,
+  );
+  backendBaseUrl = origin.toString().replaceFirst(RegExp(r'/+$'), '');
+  _kBackendHost = parsedBaseUri.host;
+  _kBackendPort = parsedBaseUri.hasPort
+      ? parsedBaseUri.port
+      : (parsedBaseUri.scheme == 'https' ? 443 : 80);
+  _kBackendHealthUri = origin.replace(path: '/', query: '');
+  _kSkipHealthCheck = parsedBaseUri.pathSegments.isNotEmpty;
+  _kProxyApiKey = dotenv.env['PROXY_API_KEY']?.trim() ?? '';
+}
 
 Future<bool> isBackendPortAcceptingConnections() async {
   Socket? socket;
@@ -154,6 +203,17 @@ class BackendHostController extends ChangeNotifier {
 
   /// Polls [pingBackendHealth] until success or [_kHealthWaitTimeout] elapses.
   Future<bool> waitForBackendHttpReady() async {
+    if (_kSkipHealthCheck) {
+      debugPrint(
+        'Health check skipped for endpoint-style PROXY_URL. '
+        'Using direct scan URL: $_kProxyScanUri',
+      );
+      _canSendHttp = true;
+      _bootstrapMessage = null;
+      notifyListeners();
+      return true;
+    }
+
     final deadline = DateTime.now().add(_kHealthWaitTimeout);
     var attempt = 1;
     while (DateTime.now().isBefore(deadline)) {
@@ -238,6 +298,12 @@ class BackendHostController extends ChangeNotifier {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
+  try {
+    await dotenv.load(fileName: 'assets/env/app.env');
+  } catch (error) {
+    _fatalEnvMissing(error);
+  }
+  _initializeBackendConfigFromEnv();
 
   if (!kIsWeb && Platform.isWindows) {
     await windowManager.ensureInitialized();
@@ -367,6 +433,21 @@ final taggedFilesProvider =
 final imagePathsProvider = loadedFilesProvider;
 final selectedImagesProvider = selectedFilesProvider;
 final tagsProvider = taggedFilesProvider;
+
+Map<String, String> _jsonHeadersWithApiKey() {
+  final headers = <String, String>{'Content-Type': 'application/json'};
+  if (_kProxyApiKey.isNotEmpty) {
+    headers['X-API-Key'] = _kProxyApiKey;
+  }
+  return headers;
+}
+
+Map<String, String> _authHeadersWithApiKey() {
+  if (_kProxyApiKey.isEmpty) {
+    return const <String, String>{};
+  }
+  return <String, String>{'X-API-Key': _kProxyApiKey};
+}
 
 class App extends ConsumerStatefulWidget {
   const App({super.key});
@@ -874,15 +955,21 @@ class HomePage extends ConsumerStatefulWidget {
 }
 
 class _HomePageState extends ConsumerState<HomePage> {
-  static final Uri _scanBadgeUri = Uri.parse(
-    '$backendBaseUrl/scan-badge',
-  );
+  static Uri get _scanUri => _kProxyScanUri;
   static final Uri _processBatchUri = Uri.parse(
     '$backendBaseUrl/process-batch',
   );
   static const Set<String> _scanFailureTokens = {
     'ERROR_READING_TEXT',
     'SERVER_ERROR',
+  };
+  static const Map<String, String> _kImageSubtypeByExtension = {
+    '.jpg': 'jpeg',
+    '.jpeg': 'jpeg',
+    '.png': 'png',
+    '.gif': 'gif',
+    '.webp': 'webp',
+    '.bmp': 'bmp',
   };
 
   final _tagController = TextEditingController();
@@ -1021,6 +1108,22 @@ class _HomePageState extends ConsumerState<HomePage> {
     );
   }
 
+  void _showErrorSnackBar(String message) {
+    ScaffoldMessenger.of(context).showSnackBar(
+      SnackBar(
+        content: Text(message),
+        backgroundColor: Colors.red,
+        behavior: SnackBarBehavior.floating,
+      ),
+    );
+  }
+
+  MediaType _mediaTypeForImagePath(String filePath) {
+    final extension = p.extension(filePath).toLowerCase();
+    final subtype = _kImageSubtypeByExtension[extension] ?? 'jpeg';
+    return MediaType('image', subtype);
+  }
+
   Future<void> _scanSelectedAnchorPhoto() async {
     final selectedPaths = ref.read(selectedFilesProvider).toList();
     if (selectedPaths.isEmpty) {
@@ -1033,16 +1136,24 @@ class _HomePageState extends ConsumerState<HomePage> {
     });
 
     try {
-      debugPrint('Sending scan request to $_scanBadgeUri');
-      final request = http.MultipartRequest('POST', _scanBadgeUri)
-        ..files.add(await http.MultipartFile.fromPath('file', selectedPath));
+      debugPrint('Sending scan request to $_scanUri');
+      final imageContentType = _mediaTypeForImagePath(selectedPath);
+      final request = http.MultipartRequest('POST', _scanUri)
+        ..headers.addAll(_authHeadersWithApiKey())
+        ..files.add(
+          await http.MultipartFile.fromPath(
+            'file',
+            selectedPath,
+            contentType: imageContentType,
+          ),
+        );
       final streamedResponse = await request.send();
       final response = await http.Response.fromStream(streamedResponse);
       debugPrint('Scan response ${response.statusCode}: ${response.body}');
 
       if (response.statusCode != 200) {
-        throw HttpException(
-          'Scan failed with status ${response.statusCode}: ${response.body}',
+        throw Exception(
+          'statusCode=${response.statusCode}, body=${response.body}',
         );
       }
 
@@ -1053,8 +1164,10 @@ class _HomePageState extends ConsumerState<HomePage> {
         );
       }
 
-      final raw = decodedBody['extracted_text'];
-      final extractedText = raw == null ? '' : raw.toString().trim();
+      final raw = decodedBody['text'];
+      final extractedText = raw == null
+          ? ''
+          : raw.toString().replaceAll(RegExp(r'\s*\n\s*'), ' ').trim();
       if (!mounted) {
         return;
       }
@@ -1075,17 +1188,21 @@ class _HomePageState extends ConsumerState<HomePage> {
           TextPosition(offset: _tagController.text.length),
         );
       });
-    } catch (_) {
+    } on SocketException {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Could not scan image. Is FastAPI running on $backendBaseUrl?',
-          ),
-        ),
-      );
+      _showErrorSnackBar('Connection refused.');
+    } on http.ClientException {
+      if (!mounted) {
+        return;
+      }
+      _showErrorSnackBar('Connection refused.');
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showErrorSnackBar(error.toString());
     } finally {
       if (mounted) {
         setState(() {
@@ -1113,14 +1230,14 @@ class _HomePageState extends ConsumerState<HomePage> {
       debugPrint('Sending batch request to $_processBatchUri');
       final response = await http.post(
         _processBatchUri,
-        headers: {'Content-Type': 'application/json'},
+        headers: _jsonHeadersWithApiKey(),
         body: jsonEncode(payload),
       );
       debugPrint('Batch response ${response.statusCode}: ${response.body}');
 
       if (response.statusCode != 200) {
-        throw HttpException(
-          'Process batch failed with status ${response.statusCode}: ${response.body}',
+        throw Exception(
+          'statusCode=${response.statusCode}, body=${response.body}',
         );
       }
 
@@ -1133,17 +1250,21 @@ class _HomePageState extends ConsumerState<HomePage> {
       _clearCurrentSelectionAndTags();
       ref.read(taggedFilesProvider.notifier).clear();
       _showProcessSuccessState();
-    } catch (_) {
+    } on SocketException {
       if (!mounted) {
         return;
       }
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text(
-            'Batch processing failed. Is FastAPI running on $backendBaseUrl?',
-          ),
-        ),
-      );
+      _showErrorSnackBar('Connection refused.');
+    } on http.ClientException {
+      if (!mounted) {
+        return;
+      }
+      _showErrorSnackBar('Connection refused.');
+    } catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showErrorSnackBar(error.toString());
     } finally {
       if (mounted) {
         setState(() {

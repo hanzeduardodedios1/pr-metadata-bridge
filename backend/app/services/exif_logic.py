@@ -2,6 +2,9 @@ import os
 from pathlib import Path, PureWindowsPath
 from exiftool import ExifToolHelper
 
+_ALLOWED_IMAGE_EXTENSIONS = {".jpg", ".jpeg"}
+
+
 def _resolve_manifest_path(manifest_path: str) -> Path:
     """
     Resolve a manifest key (Windows or POSIX-style) to an absolute host path.
@@ -47,6 +50,16 @@ def process_manifest_in_place(manifest: dict[str, str]) -> int:
             if not resolved_path.is_file():
                 print(f"   ⚠️ Warning: '{resolved_path}' does not exist. Skipping.")
                 continue
+            if resolved_path.suffix.lower() not in _ALLOWED_IMAGE_EXTENSIONS:
+                print(
+                    f"   ⚠️ Warning: '{resolved_path}' is not a supported JPEG. Skipping."
+                )
+                continue
+            if not os.access(resolved_path, os.W_OK):
+                print(
+                    f"   ⚠️ Warning: '{resolved_path}' is not writable due to file permissions. Skipping."
+                )
+                continue
 
             print(f"   -> Injecting '{vip_name}' into {resolved_path}")
             tags_to_inject = {
@@ -54,8 +67,9 @@ def process_manifest_in_place(manifest: dict[str, str]) -> int:
                 "IPTC:Keywords": vip_name,
                 "XMP:Subject": vip_name,
             }
-            # ExifToolHelper uses argument lists under the hood, so paths with spaces are safe.
-            et.set_tags(str(resolved_path), tags=tags_to_inject, params=["-overwrite_original"])
+            # Keep ExifTool backup behavior (no -overwrite_original) to avoid destructive writes.
+            # ExifTool creates a sibling backup file with "_original" suffix.
+            et.set_tags(str(resolved_path), tags=tags_to_inject)
             processed_count += 1
 
     print("✅ Processing Complete.")
