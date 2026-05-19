@@ -5,11 +5,13 @@ import 'dart:io';
 import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
-import 'package:flutter_dotenv/flutter_dotenv.dart';
+import 'package:flutter/services.dart';
 import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
+import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http_parser/http_parser.dart';
 import 'package:path/path.dart' as p;
+import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -17,10 +19,7 @@ late final String _kBackendHost;
 late final int _kBackendPort;
 late final Uri _kProxyScanUri;
 late final Uri _kBackendHealthUri;
-late final bool _kSkipHealthCheck;
-late final String _kProxyApiKey;
-const Duration _kHealthPollInterval = Duration(seconds: 1);
-const Duration _kHealthWaitTimeout = Duration(seconds: 15);
+const String _kProxyBaseUrl = 'https://clownfish-app-7pdjt.ondigitalocean.app';
 const Duration _kHealthRequestTimeout = Duration(seconds: 2);
 const Duration _kBackendGracefulShutdownTimeout = Duration(seconds: 2);
 const Duration _kBackendForceShutdownTimeout = Duration(seconds: 1);
@@ -30,6 +29,7 @@ const Color _kBrutalistBorder = Color(0xFF2A2A2A);
 const Color _kBrutalistPrimaryText = Colors.white;
 const Color _kBrutalistSecondaryText = Color(0xFF8B8C90);
 const Color _kBrutalistButton = Color(0xFF3D7AB5);
+const Color _kAnchorHighlight = Color(0xFFFFD54F);
 const Color _kStartupBackground = Color(0xFF1E1E1E);
 const Color _kStartupDivider = Color(0xFF2A2A2A);
 const double _kLabelFontSize = 11;
@@ -37,44 +37,66 @@ const double _kInputFontSize = 13;
 const double _kSectionHeaderFontSize = 15;
 const double _kPanelTitleFontSize = 18;
 
+const String _kPrefLicenseKey = 'license_key';
+const String _kPrefLicenseValidated = 'license_validated';
+// TEMP: bypass LemonSqueezy gate for local V1.1 UI testing. Set to false when store is approved.
+const bool _kBypassLicenseGate = true;
+const String _kDevLicenseKeyPlaceholder = 'dev-bypass-local-test';
+final Uri _kLemonSqueezyValidateUri = Uri.parse(
+  'https://api.lemonsqueezy.com/v1/licenses/validate',
+);
+
 final backendHostProvider = ChangeNotifierProvider<BackendHostController>(
   (ref) => throw StateError('backendHostProvider must be overridden in main()'),
 );
 
-Never _fatalEnvMissing([Object? cause]) {
+Never _fatalProxyUrlInvalid([Object? cause]) {
   final details = cause == null ? '' : '\nCause: $cause';
   throw StateError(
-    'ENV FILE MISSING\n'
-    'ENV FILE MISSING\n'
-    'ENV FILE MISSING\n'
-    'Missing required dotenv configuration. '
-    'Expected dotenv.env[\'PROXY_URL\'] to be present.$details',
+    'PROXY URL INVALID\n'
+    'PROXY URL INVALID\n'
+    'PROXY URL INVALID\n'
+    'Missing or invalid proxy configuration. '
+    'Expected _kProxyBaseUrl to be a valid absolute URL.$details',
   );
 }
 
-void _initializeBackendConfigFromEnv() {
-  final proxyUrl = dotenv.env['PROXY_URL']?.trim();
-  if (proxyUrl == null || proxyUrl.isEmpty) {
-    _fatalEnvMissing('PROXY_URL is null or empty.');
+void _initializeBackendConfigFromConstants() {
+  final proxyUrl = _kProxyBaseUrl.trim();
+  if (proxyUrl.isEmpty) {
+    _fatalProxyUrlInvalid('_kProxyBaseUrl is empty.');
   }
 
   final parsedBaseUri = Uri.tryParse(proxyUrl);
   if (parsedBaseUri == null ||
       !parsedBaseUri.hasScheme ||
       parsedBaseUri.host.isEmpty) {
-    _fatalEnvMissing('PROXY_URL is not a valid absolute URL: $proxyUrl');
+    _fatalProxyUrlInvalid(
+      '_kProxyBaseUrl is not a valid absolute URL: $proxyUrl',
+    );
   }
   final scheme = parsedBaseUri.scheme.toLowerCase();
   final host = parsedBaseUri.host.toLowerCase();
   final isLocalHost =
       host == 'localhost' || host == '127.0.0.1' || host == '::1';
   if (scheme != 'https' && !isLocalHost) {
-    _fatalEnvMissing(
-      'PROXY_URL must use https for non-local endpoints. Got: $proxyUrl',
+    _fatalProxyUrlInvalid(
+      '_kProxyBaseUrl must use https for non-local endpoints. Got: $proxyUrl',
     );
   }
 
-  _kProxyScanUri = parsedBaseUri.replace(queryParameters: const {});
+  final trimmedBasePath = parsedBaseUri.path.replaceAll(RegExp(r'/+$'), '');
+  const scanSuffix = '/api/v1/scan';
+  final scanPath = trimmedBasePath.isEmpty
+      ? scanSuffix
+      : '$trimmedBasePath$scanSuffix';
+  _kProxyScanUri = Uri(
+    scheme: parsedBaseUri.scheme,
+    userInfo: parsedBaseUri.userInfo,
+    host: parsedBaseUri.host,
+    port: parsedBaseUri.hasPort ? parsedBaseUri.port : null,
+    path: scanPath,
+  );
   final origin = Uri(
     scheme: parsedBaseUri.scheme,
     host: parsedBaseUri.host,
@@ -85,8 +107,6 @@ void _initializeBackendConfigFromEnv() {
       ? parsedBaseUri.port
       : (parsedBaseUri.scheme == 'https' ? 443 : 80);
   _kBackendHealthUri = origin.replace(path: '/', query: '');
-  _kSkipHealthCheck = parsedBaseUri.pathSegments.isNotEmpty;
-  _kProxyApiKey = dotenv.env['PROXY_API_KEY']?.trim() ?? '';
 }
 
 Future<bool> isBackendPortAcceptingConnections() async {
@@ -128,7 +148,7 @@ class BackendHostController extends ChangeNotifier {
   bool _ownsProcess = false;
   bool _isShuttingDown = false;
   Future<void>? _shutdownFuture;
-  bool _canSendHttp = false;
+  bool _canSendHttp = true;
   String? _bootstrapMessage;
   StreamSubscription<List<int>>? _stdoutSubscription;
   StreamSubscription<List<int>>? _stderrSubscription;
@@ -153,88 +173,18 @@ class BackendHostController extends ChangeNotifier {
   }
 
   Future<void> bootstrap() async {
-    _canSendHttp = false;
-
-    if (!Platform.isWindows) {
-      _ownsProcess = false;
-      _bootstrapMessage = null;
-      notifyListeners();
-      return;
-    }
-
-    if (await isBackendPortAcceptingConnections()) {
-      _ownsProcess = false;
-      _bootstrapMessage = null;
-      notifyListeners();
-      return;
-    }
-
-    final exeDir = File(Platform.resolvedExecutable).parent.path;
-    final backendExe = p.join(exeDir, 'backend.exe');
-    debugPrint('Backend spawn path: $backendExe');
-    if (!await File(backendExe).exists()) {
-      _bootstrapMessage =
-          'backend.exe was not found next to the application:\n$backendExe';
-      notifyListeners();
-      return;
-    }
-
-    try {
-      _process = await Process.start(
-        backendExe,
-        const <String>[],
-        workingDirectory: exeDir,
-        mode: ProcessStartMode.normal,
-      );
-      _ownsProcess = true;
-      // Drain child process pipes so the backend cannot block on full buffers.
-      _stdoutSubscription = _process!.stdout.listen((_) {});
-      _stderrSubscription = _process!.stderr.listen((_) {});
-    } catch (e) {
-      _bootstrapMessage = 'Failed to start backend.exe: $e';
-      notifyListeners();
-      return;
-    }
-
+    _canSendHttp = true;
+    _ownsProcess = false;
     _bootstrapMessage = null;
     notifyListeners();
   }
 
   /// Polls [pingBackendHealth] until success or [_kHealthWaitTimeout] elapses.
   Future<bool> waitForBackendHttpReady() async {
-    if (_kSkipHealthCheck) {
-      debugPrint(
-        'Health check skipped for endpoint-style PROXY_URL. '
-        'Using direct scan URL: $_kProxyScanUri',
-      );
-      _canSendHttp = true;
-      _bootstrapMessage = null;
-      notifyListeners();
-      return true;
-    }
-
-    final deadline = DateTime.now().add(_kHealthWaitTimeout);
-    var attempt = 1;
-    while (DateTime.now().isBefore(deadline)) {
-      final isHealthy = await pingBackendHealth();
-      debugPrint('Health check attempt $attempt result: $isHealthy');
-      if (isHealthy) {
-        _canSendHttp = true;
-        _bootstrapMessage = null;
-        notifyListeners();
-        return true;
-      }
-      attempt += 1;
-      await Future<void>.delayed(_kHealthPollInterval);
-    }
-    _canSendHttp = false;
-    _bootstrapMessage =
-        'Failed to initialize the local engine. Please restart the application or check if port $_kBackendPort is in use.';
-    if (_ownsProcess) {
-      await shutdownOwned();
-    }
+    _canSendHttp = true;
+    _bootstrapMessage = null;
     notifyListeners();
-    return false;
+    return true;
   }
 
   /// Stops [backend.exe] if this app started it (avoids killing a separately
@@ -297,12 +247,7 @@ class BackendHostController extends ChangeNotifier {
 
 Future<void> main() async {
   WidgetsFlutterBinding.ensureInitialized();
-  try {
-    await dotenv.load(fileName: 'assets/env/app.env');
-  } catch (error) {
-    _fatalEnvMissing(error);
-  }
-  _initializeBackendConfigFromEnv();
+  _initializeBackendConfigFromConstants();
 
   if (!kIsWeb && Platform.isWindows) {
     await windowManager.ensureInitialized();
@@ -382,12 +327,31 @@ class SelectedImagesNotifier extends StateNotifier<Set<String>> {
     state = next;
   }
 
+  void selectOnly(String filePath) {
+    state = {_normalizePath(filePath)};
+  }
+
+  void selectRange(List<String> imagePaths, int fromIndex, int toIndex) {
+    final low = fromIndex < toIndex ? fromIndex : toIndex;
+    final high = fromIndex > toIndex ? fromIndex : toIndex;
+    final next = <String>{};
+    for (var i = low; i <= high; i++) {
+      if (i >= 0 && i < imagePaths.length) {
+        next.add(_normalizePath(imagePaths[i]));
+      }
+    }
+    state = next;
+  }
+
   void clear() {
     state = <String>{};
   }
 
   void keepOnlyPaths(Set<String> validPaths) {
-    final next = {for (final p in state) if (validPaths.contains(p)) p};
+    final next = {
+      for (final p in state)
+        if (validPaths.contains(p)) p,
+    };
     if (next.length == state.length) {
       return;
     }
@@ -458,51 +422,14 @@ final imagePathsProvider = loadedFilesProvider;
 final selectedImagesProvider = selectedFilesProvider;
 final tagsProvider = taggedFilesProvider;
 
-Map<String, String> _authHeadersWithApiKey() {
-  if (_kProxyApiKey.isEmpty) {
-    return const <String, String>{};
-  }
-  return <String, String>{'X-API-Key': _kProxyApiKey};
-}
-
-/// Resolves the ExifTool binary: in debug, prefer [project root]/exiftool(.exe)
-/// or fall back to `exiftool` on PATH. In release, strictly next to the app
-/// (Windows `.exe`, Unix `exiftool` with macOS [Resources] fallback).
-Future<String> _resolveExifToolPath() async {
+String get _resolvedExifToolPath {
   if (kDebugMode) {
-    final cwd = Directory.current.path;
-    if (Platform.isWindows) {
-      final inRoot = p.join(cwd, 'exiftool.exe');
-      if (await File(inRoot).exists()) {
-        return inRoot;
-      }
-    } else {
-      final inRoot = p.join(cwd, 'exiftool');
-      if (await File(inRoot).exists()) {
-        return inRoot;
-      }
-    }
-    return 'exiftool';
+    return p.join(Directory.current.path, 'exiftool.exe');
   }
-
-  final exeParent = File(Platform.resolvedExecutable).parent.path;
-  if (Platform.isWindows) {
-    return p.join(exeParent, 'exiftool.exe');
-  }
-  if (Platform.isMacOS) {
-    final nextTo = p.join(exeParent, 'exiftool');
-    if (await File(nextTo).exists()) {
-      return nextTo;
-    }
-    final inResources = p.normalize(
-      p.join(exeParent, '..', 'Resources', 'exiftool'),
-    );
-    if (await File(inResources).exists()) {
-      return inResources;
-    }
-    return nextTo;
-  }
-  return p.join(exeParent, 'exiftool');
+  return p.join(
+    File(Platform.resolvedExecutable).parent.path,
+    'exiftool.exe',
+  );
 }
 
 class App extends ConsumerStatefulWidget {
@@ -666,10 +593,9 @@ class _AppState extends ConsumerState<App>
   }
 }
 
-enum _StartupGatePhase { loading, ready, error }
+enum _StartupGatePhase { loading, ready }
 
-/// Runs [BackendHostController.bootstrap], then HTTP health polling before
-/// revealing [child].
+/// Runs startup checks before revealing [child].
 class StartupGate extends ConsumerStatefulWidget {
   const StartupGate({required this.child, super.key});
 
@@ -681,13 +607,13 @@ class StartupGate extends ConsumerStatefulWidget {
 
 class _StartupGateState extends ConsumerState<StartupGate> {
   static const List<String> _kStartupStatusMessages = <String>[
-    'Starting backend engine...',
+    'Starting up...',
     'Connecting to Vision API...',
     'Ready.',
   ];
 
   _StartupGatePhase _phase = _StartupGatePhase.loading;
-  String? _errorText;
+  bool? _isExifToolValid;
   String _statusMessage = _kStartupStatusMessages.first;
   Timer? _statusTimer;
   int _statusMessageIndex = 0;
@@ -695,10 +621,8 @@ class _StartupGateState extends ConsumerState<StartupGate> {
   @override
   void initState() {
     super.initState();
+    _checkExifTool();
     _startStatusMessageRotation();
-    WidgetsBinding.instance.addPostFrameCallback((_) {
-      unawaited(_runStartup());
-    });
   }
 
   @override
@@ -721,47 +645,98 @@ class _StartupGateState extends ConsumerState<StartupGate> {
   }
 
   Future<void> _runStartup() async {
-    final backend = ref.read(backendHostProvider);
-    await backend.bootstrap();
+    if (_isExifToolValid != true) {
+      return;
+    }
 
+    await ref.read(backendHostProvider).bootstrap();
+    _statusTimer?.cancel();
+    setState(() {
+      _statusMessageIndex = 2;
+      _statusMessage = _kStartupStatusMessages[_statusMessageIndex];
+    });
+    await Future<void>.delayed(const Duration(milliseconds: 400));
     if (!mounted) {
       return;
     }
+    setState(() => _phase = _StartupGatePhase.ready);
+  }
 
-    if (backend.bootstrapMessage != null) {
-      setState(() {
-        _phase = _StartupGatePhase.error;
-        _errorText = backend.bootstrapMessage;
-      });
-      return;
-    }
-
-    final ok = await backend.waitForBackendHttpReady();
-    if (!mounted) {
-      return;
-    }
-
-    if (ok) {
-      _statusTimer?.cancel();
-      setState(() {
-        _statusMessageIndex = 2;
-        _statusMessage = _kStartupStatusMessages[_statusMessageIndex];
-      });
-      await Future<void>.delayed(const Duration(milliseconds: 400));
-      if (!mounted) {
+  Future<void> _checkExifTool() async {
+    try {
+      debugPrint('Resolving path...');
+      final exiftoolPath = _resolvedExifToolPath;
+      debugPrint('Checking ExifTool at: $exiftoolPath');
+      final result = await Process.run(exiftoolPath, const <String>[
+        '-ver',
+      ]).timeout(const Duration(seconds: 3));
+      if (result.exitCode == 0) {
+        if (mounted) {
+          setState(() {
+            _isExifToolValid = true;
+          });
+        }
+        unawaited(_runStartup());
         return;
       }
-      setState(() => _phase = _StartupGatePhase.ready);
-    } else {
-      setState(() {
-        _phase = _StartupGatePhase.error;
-        _errorText = backend.bootstrapMessage;
-      });
+      if (mounted) {
+        setState(() {
+          _isExifToolValid = false;
+        });
+      }
+    } catch (e) {
+      debugPrint('ExifTool check failed: $e');
+      if (mounted) {
+        setState(() => _isExifToolValid = false);
+      }
     }
   }
 
   @override
   Widget build(BuildContext context) {
+    if (_isExifToolValid == null) {
+      return const Scaffold(
+        body: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              CircularProgressIndicator(),
+              SizedBox(height: 16),
+              Text('Initializing Engine...'),
+            ],
+          ),
+        ),
+      );
+    }
+    if (_isExifToolValid == false) {
+      final targetPath = _resolvedExifToolPath;
+      final exists = File(targetPath).existsSync();
+      final exePath = Platform.resolvedExecutable;
+      final currentDir = Directory.current.path;
+      return Scaffold(
+        body: Center(
+          child: Padding(
+            padding: EdgeInsets.symmetric(horizontal: 32),
+            child: Column(
+              mainAxisSize: MainAxisSize.min,
+              children: [
+                Icon(Icons.error_outline, size: 64, color: Colors.redAccent),
+                SizedBox(height: 16),
+                Text(
+                  'ExifTool binary missing. Please reinstall the application.\n\n'
+                  '--- DIAGNOSTICS ---\n'
+                  'Target Path: $targetPath\n'
+                  'File Exists: $exists\n'
+                  'Exe Path: $exePath\n'
+                  'Current Dir: $currentDir',
+                  textAlign: TextAlign.center,
+                ),
+              ],
+            ),
+          ),
+        ),
+      );
+    }
     switch (_phase) {
       case _StartupGatePhase.ready:
         return widget.child;
@@ -830,29 +805,6 @@ class _StartupGateState extends ConsumerState<StartupGate> {
                 ),
               ),
             ],
-          ),
-        );
-      case _StartupGatePhase.error:
-        return _FullScreenStartupOverlay(
-          child: Padding(
-            padding: const EdgeInsets.symmetric(horizontal: 32),
-            child: Column(
-              mainAxisSize: MainAxisSize.min,
-              children: [
-                const Icon(Icons.error_outline, color: Colors.redAccent, size: 56),
-                const SizedBox(height: 20),
-                Text(
-                  _errorText ??
-                      'Failed to initialize the local engine. Please restart the application or check if port $_kBackendPort is in use.',
-                  textAlign: TextAlign.center,
-                  style: const TextStyle(
-                    fontSize: 16,
-                    height: 1.4,
-                    color: Colors.white70,
-                  ),
-                ),
-              ],
-            ),
           ),
         );
     }
@@ -936,6 +888,26 @@ class _PrimaryActionButtonState extends State<_PrimaryActionButton> {
   }
 }
 
+class _SessionTaggedBadge extends StatelessWidget {
+  const _SessionTaggedBadge();
+
+  static const Color _badgeGreen = Color(0xFF1D9E75);
+
+  @override
+  Widget build(BuildContext context) {
+    return Container(
+      width: 20,
+      height: 20,
+      decoration: const BoxDecoration(
+        color: _badgeGreen,
+        shape: BoxShape.circle,
+      ),
+      alignment: Alignment.center,
+      child: const Icon(Icons.check, size: 14, color: Colors.white),
+    );
+  }
+}
+
 class _DashedBorder extends StatelessWidget {
   const _DashedBorder({required this.child});
 
@@ -943,10 +915,7 @@ class _DashedBorder extends StatelessWidget {
 
   @override
   Widget build(BuildContext context) {
-    return CustomPaint(
-      painter: const _DashedBorderPainter(),
-      child: child,
-    );
+    return CustomPaint(painter: const _DashedBorderPainter(), child: child);
   }
 }
 
@@ -1029,13 +998,260 @@ class _HomePageState extends ConsumerState<HomePage> {
   bool _isScanning = false;
   bool _isProcessingBatch = false;
   bool _showProcessSuccess = false;
+  String? _scannedAnchorPath;
   Timer? _processSuccessTimer;
+  String? _licenseKey;
+  final Set<String> _processedFiles = {};
+  final Map<String, String> _sessionResults = {};
+  int? _lastClickedIndex;
+  Set<String> _vipList = {};
+  bool _isAnchorVipMatch = false;
+
+  @override
+  void initState() {
+    super.initState();
+    _loadLicenseFromPreferences();
+  }
+
+  String? get _effectiveLicenseKey {
+    if (_kBypassLicenseGate) {
+      return _kDevLicenseKeyPlaceholder;
+    }
+    final key = _licenseKey?.trim();
+    return key == null || key.isEmpty ? null : key;
+  }
+
+  Future<void> _loadLicenseFromPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = prefs.getString(_kPrefLicenseKey);
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      // When bypass is on, treat license as valid so scan/UI flow is not blocked.
+      _licenseKey = _kBypassLicenseGate ? _kDevLicenseKeyPlaceholder : key;
+    });
+  }
+
+  Future<void> _showLicenseDialog() async {
+    final controller = TextEditingController(text: _licenseKey ?? '');
+    String? dialogError;
+    var submitting = false;
+
+    await showDialog<void>(
+      context: context,
+      barrierDismissible: !submitting,
+      builder: (dialogContext) {
+        return StatefulBuilder(
+          builder: (context, setDialogState) {
+            Future<void> submit() async {
+              final enteredKey = controller.text.trim();
+              if (enteredKey.isEmpty) {
+                setDialogState(() {
+                  dialogError = 'Please enter a license key.';
+                });
+                return;
+              }
+              setDialogState(() {
+                submitting = true;
+                dialogError = null;
+              });
+              http.Response response;
+              try {
+                response = await http
+                    .post(
+                      _kLemonSqueezyValidateUri,
+                      headers: const {
+                        'Accept': 'application/json',
+                        'Content-Type': 'application/json',
+                      },
+                      body: jsonEncode(<String, String>{
+                        'license_key': enteredKey,
+                      }),
+                    )
+                    .timeout(const Duration(seconds: 25));
+              } on Object catch (_) {
+                setDialogState(() {
+                  submitting = false;
+                  dialogError =
+                      'Could not validate. Check your connection and try again.';
+                });
+                return;
+              }
+
+              Map<String, dynamic>? bodyMap;
+              try {
+                final decoded = jsonDecode(response.body);
+                bodyMap = decoded is Map<String, dynamic> ? decoded : null;
+              } on FormatException {
+                bodyMap = null;
+              }
+
+              final valid = bodyMap?['valid'] == true;
+              final explicitInvalid = bodyMap?['valid'] == false;
+
+              if (response.statusCode == 200 && valid) {
+                final prefs = await SharedPreferences.getInstance();
+                await prefs.setString(_kPrefLicenseKey, enteredKey);
+                await prefs.setBool(_kPrefLicenseValidated, true);
+                if (!mounted) {
+                  return;
+                }
+                setState(() {
+                  _licenseKey = enteredKey;
+                });
+                if (dialogContext.mounted) {
+                  Navigator.of(dialogContext).pop();
+                }
+                if (!context.mounted) {
+                  return;
+                }
+                ScaffoldMessenger.of(context).showSnackBar(
+                  const SnackBar(
+                    content: Text('License activated successfully'),
+                    behavior: SnackBarBehavior.floating,
+                  ),
+                );
+              } else if (explicitInvalid ||
+                  (response.statusCode == 200 && bodyMap != null && !valid)) {
+                setDialogState(() {
+                  submitting = false;
+                  dialogError =
+                      'Invalid license key. Please check your purchase email.';
+                });
+              } else {
+                setDialogState(() {
+                  submitting = false;
+                  dialogError =
+                      'Could not validate. Check your connection and try again.';
+                });
+              }
+            }
+
+            return AlertDialog(
+              title: const Text('License Key'),
+              content: SingleChildScrollView(
+                child: Column(
+                  mainAxisSize: MainAxisSize.min,
+                  crossAxisAlignment: CrossAxisAlignment.stretch,
+                  children: [
+                    const Text(
+                      'Enter your license key to use cloud scan.',
+                      style: TextStyle(
+                        fontSize: _kInputFontSize,
+                        color: _kBrutalistSecondaryText,
+                      ),
+                    ),
+                    const SizedBox(height: 12),
+                    TextField(
+                      controller: controller,
+                      enabled: !submitting,
+                      decoration: InputDecoration(
+                        hintText: 'License key',
+                        errorText: dialogError,
+                        border: const OutlineInputBorder(),
+                      ),
+                      style: const TextStyle(fontSize: _kInputFontSize),
+                    ),
+                  ],
+                ),
+              ),
+              actions: [
+                TextButton(
+                  onPressed: submitting
+                      ? null
+                      : () => Navigator.of(dialogContext).pop(),
+                  child: const Text('Cancel'),
+                ),
+                TextButton(
+                  onPressed: submitting ? null : submit,
+                  child: submitting
+                      ? const SizedBox(
+                          height: 18,
+                          width: 18,
+                          child: CircularProgressIndicator(strokeWidth: 2),
+                        )
+                      : const Text('Submit'),
+                ),
+              ],
+            );
+          },
+        );
+      },
+    );
+    controller.dispose();
+  }
 
   @override
   void dispose() {
     _processSuccessTimer?.cancel();
     _tagController.dispose();
     super.dispose();
+  }
+
+  bool _isVipName(String name) {
+    if (_vipList.isEmpty) {
+      return false;
+    }
+    return _vipList.contains(name.trim().toLowerCase());
+  }
+
+  Set<String> _parseVipListFromText(String content) {
+    return content
+        .split(RegExp(r'\r?\n'))
+        .map((line) => line.trim())
+        .where((line) => line.isNotEmpty)
+        .map((line) => line.toLowerCase())
+        .toSet();
+  }
+
+  Future<void> _showPasteVipListDialog() async {
+    final controller = TextEditingController(text: _vipList.join('\n'));
+
+    final saved = await showDialog<bool>(
+      context: context,
+      builder: (dialogContext) {
+        return AlertDialog(
+          title: const Text('Paste VIP List'),
+          content: SizedBox(
+            width: 400,
+            child: TextField(
+              controller: controller,
+              minLines: 5,
+              maxLines: 15,
+              keyboardType: TextInputType.multiline,
+              decoration: const InputDecoration(
+                hintText: 'One name per line',
+                border: OutlineInputBorder(),
+              ),
+            ),
+          ),
+          actions: [
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(false),
+              child: const Text('Cancel'),
+            ),
+            TextButton(
+              onPressed: () => Navigator.of(dialogContext).pop(true),
+              child: const Text('Save'),
+            ),
+          ],
+        );
+      },
+    );
+
+    final pastedText = controller.text;
+    controller.dispose();
+
+    if (saved != true || !mounted) {
+      return;
+    }
+
+    final names = _parseVipListFromText(pastedText);
+    setState(() {
+      _vipList = names;
+      _isAnchorVipMatch = _isVipName(_tagController.text);
+    });
   }
 
   void _assignTag() {
@@ -1061,7 +1277,8 @@ class _HomePageState extends ConsumerState<HomePage> {
     String? rawFolder;
     if (imagePaths.isNotEmpty) {
       rawFolder = p.dirname(imagePaths.first);
-    } else if (currentLoadDirectory != null && currentLoadDirectory.isNotEmpty) {
+    } else if (currentLoadDirectory != null &&
+        currentLoadDirectory.isNotEmpty) {
       rawFolder = currentLoadDirectory;
     } else {
       return null;
@@ -1110,23 +1327,123 @@ class _HomePageState extends ConsumerState<HomePage> {
     await launchUrl(uri);
   }
 
+  void _clearSessionProcessedFiles() {
+    _processedFiles.clear();
+    _sessionResults.clear();
+    _lastClickedIndex = null;
+  }
+
+  String _escapeCsvField(String value) {
+    if (value.contains('"') ||
+        value.contains(',') ||
+        value.contains('\n') ||
+        value.contains('\r')) {
+      return '"${value.replaceAll('"', '""')}"';
+    }
+    return value;
+  }
+
+  String _buildCsvContent() {
+    final buffer = StringBuffer()..writeln('Filename,Extracted Name');
+    final sortedPaths = _sessionResults.keys.toList()..sort();
+    for (final filePath in sortedPaths) {
+      final filename = p.basename(filePath);
+      final extractedName = _sessionResults[filePath] ?? '';
+      buffer.writeln(
+        '${_escapeCsvField(filename)},${_escapeCsvField(extractedName)}',
+      );
+    }
+    return buffer.toString();
+  }
+
+  String _formatExportTimestamp(DateTime dateTime) {
+    String two(int value) => value.toString().padLeft(2, '0');
+    return '${dateTime.year}${two(dateTime.month)}${two(dateTime.day)}_'
+        '${two(dateTime.hour)}${two(dateTime.minute)}${two(dateTime.second)}';
+  }
+
+  Future<void> _exportToCSV() async {
+    if (_sessionResults.isEmpty) {
+      ScaffoldMessenger.of(context).showSnackBar(
+        const SnackBar(
+          content: Text('No processed photos to export yet.'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+      return;
+    }
+
+    try {
+      final downloadsDir = await getDownloadsDirectory();
+      if (downloadsDir == null) {
+        if (!mounted) {
+          return;
+        }
+        _showErrorSnackBar('Could not locate your Downloads folder.');
+        return;
+      }
+
+      final timestamp = _formatExportTimestamp(DateTime.now());
+      final filePath = p.join(
+        downloadsDir.path,
+        'CaptionFast_Export_$timestamp.csv',
+      );
+      await File(filePath).writeAsString(_buildCsvContent());
+
+      if (!mounted) {
+        return;
+      }
+      ScaffoldMessenger.of(context).showSnackBar(
+        SnackBar(
+          content: Text('Exported roster to $filePath'),
+          behavior: SnackBarBehavior.floating,
+        ),
+      );
+    } on Object catch (error) {
+      if (!mounted) {
+        return;
+      }
+      _showErrorSnackBar('CSV export failed: $error');
+    }
+  }
+
+  void _onThumbnailTap(int index, String filePath) {
+    final isCtrl = HardwareKeyboard.instance.isControlPressed;
+    final isShift = HardwareKeyboard.instance.isShiftPressed;
+    final notifier = ref.read(selectedFilesProvider.notifier);
+    final imagePaths = ref.read(loadedFilesProvider);
+
+    if (isShift && _lastClickedIndex != null) {
+      notifier.selectRange(imagePaths, _lastClickedIndex!, index);
+    } else if (isCtrl) {
+      notifier.toggle(filePath);
+    } else {
+      notifier.selectOnly(filePath);
+    }
+    setState(() => _lastClickedIndex = index);
+  }
+
   void _clearCurrentSelectionAndTags() {
     ref.read(selectedFilesProvider.notifier).clear();
     setState(() {
       _tagController.clear();
+      _lastClickedIndex = null;
+      _isAnchorVipMatch = false;
     });
   }
 
   Future<void> _pickFolderFromBreadcrumb() async {
+    final imagePaths = ref.read(loadedFilesProvider);
     final tags = ref.read(taggedFilesProvider);
-    if (tags.isNotEmpty) {
+    final hasUnprocessedTaggedPhotos = imagePaths.isNotEmpty && tags.isNotEmpty;
+    if (hasUnprocessedTaggedPhotos) {
       final shouldDiscard = await showDialog<bool>(
         context: context,
         builder: (dialogContext) {
           return AlertDialog(
-            title: const Text('Discard tagged photos?'),
-            content: Text(
-              "You have ${tags.length} tagged photos that haven't been processed.",
+            title: const Text('Unsaved Changes'),
+            content: const Text(
+              'You have unprocessed tags. Are you sure you want to change folders and lose this data?',
             ),
             actions: [
               TextButton(
@@ -1135,7 +1452,7 @@ class _HomePageState extends ConsumerState<HomePage> {
               ),
               TextButton(
                 onPressed: () => Navigator.of(dialogContext).pop(true),
-                child: const Text('Load Anyway'),
+                child: const Text('Discard'),
               ),
             ],
           );
@@ -1159,10 +1476,12 @@ class _HomePageState extends ConsumerState<HomePage> {
     setState(() {
       _showProcessSuccess = false;
       _tagController.clear();
+      _isAnchorVipMatch = false;
+      _clearSessionProcessedFiles();
     });
-    ref.read(loadedFilesProvider.notifier).loadJpegsFromDirectory(
-      selectedDirectory,
-    );
+    ref
+        .read(loadedFilesProvider.notifier)
+        .loadJpegsFromDirectory(selectedDirectory);
   }
 
   void _showProcessSuccessState() {
@@ -1219,12 +1538,53 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   Future<void> _scanSelectedAnchorPhoto() async {
+    final licenseKey = _effectiveLicenseKey;
+    // Blocking gate — skipped while _kBypassLicenseGate is true.
+    if (!_kBypassLicenseGate &&
+        (licenseKey == null || licenseKey.isEmpty)) {
+      await _showLicenseDialog();
+      return;
+    }
+
     final selectedPaths = ref.read(selectedFilesProvider).toList();
-    if (selectedPaths.isEmpty) {
+    if (selectedPaths.length != 1) {
       return;
     }
 
     final selectedPath = selectedPaths.first;
+    if (_scannedAnchorPath != null && _scannedAnchorPath != selectedPath) {
+      final shouldReplace = await showDialog<bool>(
+        context: context,
+        builder: (dialogContext) {
+          return AlertDialog(
+            title: const Text('Replace Anchor?'),
+            content: const Text(
+              'Scanning a new photo will replace the current anchor.\nContinue?',
+            ),
+            actions: [
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(false),
+                child: const Text('Cancel'),
+              ),
+              TextButton(
+                onPressed: () => Navigator.of(dialogContext).pop(true),
+                child: const Text('Continue'),
+              ),
+            ],
+          );
+        },
+      );
+      if (shouldReplace != true) {
+        return;
+      }
+      if (!mounted) {
+        return;
+      }
+      setState(() {
+        _scannedAnchorPath = null;
+      });
+    }
+
     setState(() {
       _isScanning = true;
     });
@@ -1232,8 +1592,8 @@ class _HomePageState extends ConsumerState<HomePage> {
     try {
       debugPrint('Sending scan request to $_scanUri');
       final imageContentType = _mediaTypeForImagePath(selectedPath);
-      final request = http.MultipartRequest('POST', _scanUri)
-        ..headers.addAll(_authHeadersWithApiKey())
+      final requestUri = Uri.parse(_scanUri.toString());
+      final request = http.MultipartRequest('POST', requestUri)
         ..files.add(
           await http.MultipartFile.fromPath(
             'file',
@@ -1241,6 +1601,8 @@ class _HomePageState extends ConsumerState<HomePage> {
             contentType: imageContentType,
           ),
         );
+      request.headers['X-API-Key'] =
+          licenseKey ?? _kDevLicenseKeyPlaceholder;
       final streamedResponse = await request.send();
       final response = await http.Response.fromStream(streamedResponse);
       debugPrint('Scan response ${response.statusCode}: ${response.body}');
@@ -1281,6 +1643,8 @@ class _HomePageState extends ConsumerState<HomePage> {
         _tagController.selection = TextSelection.fromPosition(
           TextPosition(offset: _tagController.text.length),
         );
+        _scannedAnchorPath = selectedPath;
+        _isAnchorVipMatch = _isVipName(extractedText);
       });
     } on SocketException {
       if (!mounted) {
@@ -1309,9 +1673,6 @@ class _HomePageState extends ConsumerState<HomePage> {
   Future<void> _processBatch() async {
     final tags = ref.read(taggedFilesProvider);
     if (tags.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(content: Text('No tagged images to process.')),
-      );
       return;
     }
 
@@ -1331,26 +1692,33 @@ class _HomePageState extends ConsumerState<HomePage> {
 
     final paths = tags.keys.toList()..sort();
     try {
-      final exifPath = await _resolveExifToolPath();
+      final exifPath = _resolvedExifToolPath;
       var allSucceeded = true;
       for (final filePath in paths) {
         if (!mounted) {
           return;
         }
 
+        final fileSubject = tags[filePath] ?? subject;
         final args = <String>[
-          '-Subject=$subject',
-          '-Keywords=$subject',
+          '-XMP:Subject=${_tagController.text}',
+          '-IPTC:Keywords=${_tagController.text}',
+          '-XPKeywords=${_tagController.text}',
+          '-XPSubject=${_tagController.text}',
+          if (_isVipName(fileSubject)) '-XMP:Rating=5',
           '-overwrite_original',
           filePath,
         ];
 
         try {
-          final result = await Process.run(
-            exifPath,
-            args,
-          );
-          if (result.exitCode != 0) {
+          final result = await Process.run(exifPath, args);
+          if (result.exitCode == 0) {
+            final normalizedPath = p.normalize(filePath);
+            setState(() {
+              _processedFiles.add(normalizedPath);
+              _sessionResults[normalizedPath] = subject.trim();
+            });
+          } else {
             allSucceeded = false;
             final err = result.stderr.toString();
             debugPrint(
@@ -1383,11 +1751,12 @@ class _HomePageState extends ConsumerState<HomePage> {
       }
 
       if (allSucceeded) {
-        ScaffoldMessenger.of(context).showSnackBar(
-          const SnackBar(content: Text('Metadata injected successfully!')),
-        );
-        _clearCurrentSelectionAndTags();
-        ref.read(taggedFilesProvider.notifier).clear();
+        ref.read(selectedFilesProvider.notifier).clear();
+        setState(() {
+          _tagController.clear();
+          _scannedAnchorPath = null;
+          _isAnchorVipMatch = false;
+        });
         _showProcessSuccessState();
       }
     } finally {
@@ -1405,8 +1774,14 @@ class _HomePageState extends ConsumerState<HomePage> {
     final selected = ref.watch(selectedFilesProvider);
     final tags = ref.watch(taggedFilesProvider);
     final backend = ref.watch(backendHostProvider);
-    final currentLoadDirectory =
-        ref.read(loadedFilesProvider.notifier).currentLoadDirectory;
+    final scanTooltip = selected.isEmpty
+        ? 'Select a photo to scan'
+        : selected.length > 1
+        ? 'Select only one photo to scan'
+        : 'Scan this photo for text';
+    final currentLoadDirectory = ref
+        .read(loadedFilesProvider.notifier)
+        .currentLoadDirectory;
 
     return Scaffold(
       body: Column(
@@ -1511,11 +1886,22 @@ class _HomePageState extends ConsumerState<HomePage> {
                                     child: _DashedBorder(
                                       child: InkWell(
                                         onTap: () async {
-                                          await ref
+                                          final loaded = await ref
                                               .read(
                                                 loadedFilesProvider.notifier,
                                               )
                                               .pickFolderAndLoadJpegs();
+                                          if (loaded && mounted) {
+                                            ref
+                                                .read(
+                                                  selectedFilesProvider
+                                                      .notifier,
+                                                )
+                                                .clear();
+                                            setState(
+                                              _clearSessionProcessedFiles,
+                                            );
+                                          }
                                         },
                                         child: Container(
                                           width: double.infinity,
@@ -1527,7 +1913,8 @@ class _HomePageState extends ConsumerState<HomePage> {
                                             mainAxisSize: MainAxisSize.min,
                                             children: [
                                               Icon(
-                                                Icons.add_photo_alternate_outlined,
+                                                Icons
+                                                    .add_photo_alternate_outlined,
                                                 size: 54,
                                                 color: _kBrutalistSecondaryText,
                                               ),
@@ -1536,7 +1923,8 @@ class _HomePageState extends ConsumerState<HomePage> {
                                                 'Drop folder here or click to browse',
                                                 style: TextStyle(
                                                   color: _kBrutalistPrimaryText,
-                                                  fontSize: _kPanelTitleFontSize,
+                                                  fontSize:
+                                                      _kPanelTitleFontSize,
                                                   fontWeight: FontWeight.w500,
                                                 ),
                                                 textAlign: TextAlign.center,
@@ -1579,20 +1967,25 @@ class _HomePageState extends ConsumerState<HomePage> {
                                         final isSelected = selected.contains(
                                           filePath,
                                         );
+                                        final isAnchor =
+                                            filePath == _scannedAnchorPath;
+                                        final isProcessed = _processedFiles
+                                            .contains(filePath);
                                         final assignedTag = tags[filePath];
 
-                                        return InkWell(
-                                          onTap: () => ref
-                                              .read(selectedFilesProvider.notifier)
-                                              .toggle(filePath),
+                                        return GestureDetector(
+                                          onTap: () =>
+                                              _onThumbnailTap(index, filePath),
                                           child: Container(
                                             decoration: BoxDecoration(
                                               color: _kBrutalistSidebar,
                                               border: Border.all(
-                                                color: isSelected
-                                                    ? _kBrutalistButton
-                                                    : _kBrutalistBorder,
-                                                width: 1,
+                                                color: isAnchor
+                                                    ? _kAnchorHighlight
+                                                    : (isSelected
+                                                          ? _kBrutalistButton
+                                                          : _kBrutalistBorder),
+                                                width: isAnchor ? 2 : 1,
                                               ),
                                             ),
                                             padding: const EdgeInsets.all(8),
@@ -1601,27 +1994,59 @@ class _HomePageState extends ConsumerState<HomePage> {
                                                   CrossAxisAlignment.start,
                                               children: [
                                                 Expanded(
-                                                  child: Image.file(
-                                                    File(filePath),
-                                                    fit: BoxFit.cover,
-                                                    width: double.infinity,
-                                                    errorBuilder:
-                                                        (_, _, _) => Container(
-                                                          color: const Color(
-                                                            0xFF222224,
-                                                          ),
-                                                          alignment:
-                                                              Alignment.center,
-                                                          child: const Text(
-                                                            'Preview N/A',
-                                                            style: TextStyle(
-                                                              color:
-                                                                  _kBrutalistSecondaryText,
-                                                              fontSize:
-                                                                  _kLabelFontSize,
-                                                            ),
+                                                  child: Stack(
+                                                    children: [
+                                                      Positioned.fill(
+                                                        child: Image.file(
+                                                          File(filePath),
+                                                          fit: BoxFit.cover,
+                                                          width:
+                                                              double.infinity,
+                                                          errorBuilder:
+                                                              (
+                                                                _,
+                                                                _,
+                                                                _,
+                                                              ) => Container(
+                                                                color:
+                                                                    const Color(
+                                                                      0xFF222224,
+                                                                    ),
+                                                                alignment:
+                                                                    Alignment
+                                                                        .center,
+                                                                child: const Text(
+                                                                  'Preview N/A',
+                                                                  style: TextStyle(
+                                                                    color:
+                                                                        _kBrutalistSecondaryText,
+                                                                    fontSize:
+                                                                        _kLabelFontSize,
+                                                                  ),
+                                                                ),
+                                                              ),
+                                                        ),
+                                                      ),
+                                                      if (isAnchor)
+                                                        const Positioned(
+                                                          top: 8,
+                                                          right: 8,
+                                                          child: Icon(
+                                                            Icons
+                                                                .center_focus_strong,
+                                                            color:
+                                                                _kAnchorHighlight,
+                                                            size: 20,
                                                           ),
                                                         ),
+                                                      if (isProcessed)
+                                                        const Positioned(
+                                                          top: 4,
+                                                          right: 4,
+                                                          child:
+                                                              _SessionTaggedBadge(),
+                                                        ),
+                                                    ],
                                                   ),
                                                 ),
                                                 const SizedBox(height: 8),
@@ -1639,7 +2064,7 @@ class _HomePageState extends ConsumerState<HomePage> {
                                                 ),
                                                 Text(
                                                   assignedTag == null
-                                                      ? 'Tag: (none)'
+                                                      ? 'Unassigned'
                                                       : 'Tag: $assignedTag',
                                                   maxLines: 1,
                                                   overflow:
@@ -1701,35 +2126,100 @@ class _HomePageState extends ConsumerState<HomePage> {
                             ],
                           ),
                         ),
-                        const SizedBox(height: 12),
-                        Expanded(
-                          child: SingleChildScrollView(
-                            padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
-                            child: Column(
-                              crossAxisAlignment: CrossAxisAlignment.stretch,
-                              children: [
-                                const _StepHeading(number: 1, label: 'Anchor'),
-                                const SizedBox(height: 8),
-                                _PrimaryActionButton(
-                                  onPressed:
-                                      selected.isEmpty ||
-                                          _isScanning ||
-                                          !backend.canSendHttp
-                                      ? null
-                                      : _scanSelectedAnchorPhoto,
-                                  child: _isScanning
-                                      ? const SizedBox(
-                                          height: 18,
-                                          width: 18,
-                                          child: CircularProgressIndicator(
-                                            strokeWidth: 2,
-                                            color: _kBrutalistPrimaryText,
+                                const SizedBox(height: 12),
+                                Padding(
+                                  padding: const EdgeInsets.symmetric(horizontal: 16),
+                                  child: SizedBox(
+                                    width: double.infinity,
+                                    child: OutlinedButton(
+                                      onPressed: _showPasteVipListDialog,
+                                      style: OutlinedButton.styleFrom(
+                                        backgroundColor: Colors.transparent,
+                                        foregroundColor: _kBrutalistPrimaryText,
+                                        side: const BorderSide(
+                                          color: _kBrutalistBorder,
+                                          width: 1,
+                                        ),
+                                        shape: const RoundedRectangleBorder(
+                                          borderRadius: BorderRadius.zero,
+                                        ),
+                                        padding: const EdgeInsets.symmetric(
+                                          vertical: 12,
+                                        ),
+                                      ),
+                                      child: Row(
+                                        mainAxisAlignment: MainAxisAlignment.center,
+                                        children: [
+                                          const Icon(Icons.content_paste, size: 18),
+                                          const SizedBox(width: 8),
+                                          Column(
+                                            mainAxisSize: MainAxisSize.min,
+                                            children: [
+                                              const Text('Paste VIP List'),
+                                              if (_vipList.isNotEmpty)
+                                                Text(
+                                                  'VIPs Loaded: ${_vipList.length}',
+                                                  style: Theme.of(context)
+                                                      .textTheme
+                                                      .bodySmall
+                                                      ?.copyWith(
+                                                        color: _kBrutalistPrimaryText
+                                                            .withValues(alpha: 0.7),
+                                                      ),
+                                                ),
+                                            ],
                                           ),
-                                        )
-                                      : const Text('Scan Selected Anchor Photo'),
+                                        ],
+                                      ),
+                                    ),
+                                  ),
+                                ),
+                                const SizedBox(height: 12),
+                                Expanded(
+                                  child: SingleChildScrollView(
+                                    padding: const EdgeInsets.fromLTRB(16, 8, 16, 16),
+                                    child: Column(
+                                      crossAxisAlignment: CrossAxisAlignment.stretch,
+                                      children: [
+                                        const _StepHeading(number: 1, label: 'Anchor'),
+                                const SizedBox(height: 8),
+                                Tooltip(
+                                  message: scanTooltip,
+                                  child: _PrimaryActionButton(
+                                    onPressed:
+                                        selected.length != 1 ||
+                                            _isScanning ||
+                                            !backend.canSendHttp
+                                        ? null
+                                        : () {
+                                            final key = _effectiveLicenseKey;
+                                            // Blocking gate — skipped while _kBypassLicenseGate is true.
+                                            if (!_kBypassLicenseGate &&
+                                                (key == null || key.isEmpty)) {
+                                              _showLicenseDialog();
+                                            } else {
+                                              _scanSelectedAnchorPhoto();
+                                            }
+                                          },
+                                    child: _isScanning
+                                        ? const SizedBox(
+                                            height: 18,
+                                            width: 18,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 2,
+                                              color: _kBrutalistPrimaryText,
+                                            ),
+                                          )
+                                        : const Text(
+                                            'Scan Selected Anchor Photo',
+                                          ),
+                                  ),
                                 ),
                                 const SizedBox(height: 20),
-                                const Divider(height: 1, color: _kBrutalistBorder),
+                                const Divider(
+                                  height: 1,
+                                  color: _kBrutalistBorder,
+                                ),
                                 const SizedBox(height: 20),
                                 const _StepHeading(number: 2, label: 'Subject'),
                                 const SizedBox(height: 8),
@@ -1744,6 +2234,9 @@ class _HomePageState extends ConsumerState<HomePage> {
                                 const SizedBox(height: 6),
                                 TextField(
                                   controller: _tagController,
+                                  onChanged: (_) => setState(() {
+                                    _isAnchorVipMatch = _isVipName(_tagController.text);
+                                  }),
                                   style: const TextStyle(
                                     fontSize: _kInputFontSize,
                                   ),
@@ -1752,13 +2245,56 @@ class _HomePageState extends ConsumerState<HomePage> {
                                     border: OutlineInputBorder(),
                                   ),
                                 ),
+                                if (_isAnchorVipMatch) ...[
+                                  const SizedBox(height: 8),
+                                  Container(
+                                    padding: const EdgeInsets.symmetric(
+                                      horizontal: 10,
+                                      vertical: 6,
+                                    ),
+                                    decoration: BoxDecoration(
+                                      color: const Color(0xFF3D3520),
+                                      border: Border.all(
+                                        color: _kAnchorHighlight,
+                                        width: 1,
+                                      ),
+                                    ),
+                                    child: const Row(
+                                      mainAxisSize: MainAxisSize.min,
+                                      children: [
+                                        Icon(
+                                          Icons.star,
+                                          size: 14,
+                                          color: _kAnchorHighlight,
+                                        ),
+                                        SizedBox(width: 6),
+                                        Text(
+                                          'VIP MATCH',
+                                          style: TextStyle(
+                                            color: _kAnchorHighlight,
+                                            fontSize: _kLabelFontSize,
+                                            fontWeight: FontWeight.w700,
+                                            letterSpacing: 0.8,
+                                          ),
+                                        ),
+                                      ],
+                                    ),
+                                  ),
+                                ],
                                 const SizedBox(height: 20),
-                                const Divider(height: 1, color: _kBrutalistBorder),
+                                const Divider(
+                                  height: 1,
+                                  color: _kBrutalistBorder,
+                                ),
                                 const SizedBox(height: 20),
                                 const _StepHeading(number: 3, label: 'Tag'),
                                 const SizedBox(height: 8),
                                 _PrimaryActionButton(
-                                  onPressed: _assignTag,
+                                  onPressed:
+                                      _tagController.text.trim().isEmpty ||
+                                          selected.isEmpty
+                                      ? null
+                                      : _assignTag,
                                   child: const Text('Assign Name to Selected'),
                                 ),
                                 const SizedBox(height: 10),
@@ -1792,7 +2328,10 @@ class _HomePageState extends ConsumerState<HomePage> {
                                   ),
                                 ),
                                 const SizedBox(height: 20),
-                                const Divider(height: 1, color: _kBrutalistBorder),
+                                const Divider(
+                                  height: 1,
+                                  color: _kBrutalistBorder,
+                                ),
                               ],
                             ),
                           ),
@@ -1802,33 +2341,66 @@ class _HomePageState extends ConsumerState<HomePage> {
                           decoration: const BoxDecoration(
                             color: _kBrutalistSidebar,
                             border: Border(
-                              top: BorderSide(color: _kBrutalistBorder, width: 1),
+                              top: BorderSide(
+                                color: _kBrutalistBorder,
+                                width: 1,
+                              ),
                             ),
                           ),
                           child: SizedBox(
                             height: 70,
-                            child: _PrimaryActionButton(
-                              onPressed:
-                                  _isProcessingBatch ? null : _process,
-                              padding: const EdgeInsets.symmetric(vertical: 20),
-                              child: _isProcessingBatch
-                                  ? const SizedBox(
-                                      height: 24,
-                                      width: 24,
-                                      child: CircularProgressIndicator(
-                                        strokeWidth: 3,
-                                        color: _kBrutalistPrimaryText,
-                                      ),
-                                    )
-                                  : Text(
-                                      _showProcessSuccess
-                                          ? 'Success!'
-                                          : 'Process Batch',
-                                      style: const TextStyle(
-                                        fontSize: _kPanelTitleFontSize,
-                                        fontWeight: FontWeight.w700,
+                            child: Row(
+                              children: [
+                                Expanded(
+                                  child: _PrimaryActionButton(
+                                    onPressed:
+                                        _sessionResults.isEmpty
+                                        ? null
+                                        : _exportToCSV,
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 20,
+                                    ),
+                                    child: const Text(
+                                      'Export CSV',
+                                      style: TextStyle(
+                                        fontSize: _kInputFontSize,
+                                        fontWeight: FontWeight.w600,
                                       ),
                                     ),
+                                  ),
+                                ),
+                                const SizedBox(width: 12),
+                                Expanded(
+                                  flex: 2,
+                                  child: _PrimaryActionButton(
+                                    onPressed:
+                                        _isProcessingBatch || tags.isEmpty
+                                        ? null
+                                        : _process,
+                                    padding: const EdgeInsets.symmetric(
+                                      vertical: 20,
+                                    ),
+                                    child: _isProcessingBatch
+                                        ? const SizedBox(
+                                            height: 24,
+                                            width: 24,
+                                            child: CircularProgressIndicator(
+                                              strokeWidth: 3,
+                                              color: _kBrutalistPrimaryText,
+                                            ),
+                                          )
+                                        : Text(
+                                            _showProcessSuccess
+                                                ? 'Success!'
+                                                : 'Process Batch',
+                                            style: const TextStyle(
+                                              fontSize: _kPanelTitleFontSize,
+                                              fontWeight: FontWeight.w700,
+                                            ),
+                                          ),
+                                  ),
+                                ),
+                              ],
                             ),
                           ),
                         ),

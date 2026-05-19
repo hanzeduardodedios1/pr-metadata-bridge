@@ -1,0 +1,61 @@
+CaptionFast — Cursor Rules
+B2B Windows Desktop Utility for Corporate Event Photographers
+Architecture
+Frontend: Flutter Windows Desktop (main.dart is single source of truth).
+
+Backend: DigitalOcean FastAPI Proxy (No local servers, no Python locally).
+
+ExifTool: Run via Process.run(), located using Platform.resolvedExecutable.
+
+Security & State
+NO client-side secrets. Use hardcoded proxy url.
+
+NO Provider/Riverpod. Use setState.
+
+NO third-party grid/selection packages. Use native GestureDetector + HardwareKeyboard.
+
+V1.1 Core Workflow (Canonical)
+State Variables (Strictly one-word lowercase)
+anchorpath: String? — OCR source, set on click
+
+selectedphotos: Set — batch write targets
+
+processedfiles: Set — session green badge tracking
+
+tagcontroller: TextEditingController — subject name field
+
+viplist: Set — lowercase parsed VIP names
+
+licensekey: String? — LemonSqueezy validated key
+
+Phase 0: Safety Check
+On initState: verify exiftool.exe exists via Platform.resolvedExecutable. If missing: block entire UI.
+
+Phase 1: Session Init
+On folder load: clear processedfiles, selectedphotos, anchorpath, tagcontroller.
+VIP list parser: strip titles/punctuation/numbers, lowercase, store to viplist.
+
+Phase 2: Selection Model
+Single click → set anchorpath (gold border).
+Ctrl-click → toggle in/out of selectedphotos (blue border).
+Shift-click → range select into selectedphotos (blue border).
+anchorpath is NEVER added to selectedphotos.
+
+Phase 3: OCR
+Send only anchorpath to proxy.
+Flutter pre-populates tagcontroller with result. User verifies/edits. Never auto-submit.
+
+Phase 4: Assign Batch
+VIP check: tagcontroller.text.toLowerCase() in viplist.
+If VIP match: append -XMP:Label=Red to exiftool args.
+Write to all files in selectedphotos.
+On exitCode == 0: add to processedfiles.
+On completion: clear selectedphotos, anchorpath, tagcontroller (DO NOT clear processedfiles).
+
+Phase 5: Fallback
+If tagcontroller.text not empty AND selectedphotos not empty: Assign Batch enabled. Bypasses OCR, works offline.
+
+Build & Testing Sequence
+Run Tests: flutter test
+
+Build Command: flutter build windows --release

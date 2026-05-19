@@ -1,0 +1,64 @@
+CaptionFast — Cursor Rules
+B2B Windows Desktop Utility for Corporate Event Photographers
+Architecture
+Frontend: Flutter Windows Desktop (main.dart is single source of truth).
+
+Backend: DigitalOcean FastAPI Proxy (No local servers, no Python locally).
+
+ExifTool: Run via Process.run(), located using Platform.resolvedExecutable.
+
+Security & State
+NO client-side secrets. Use hardcoded _kProxyBaseUrl.
+
+NO Provider/Riverpod. Use setState.
+
+NO third-party grid/selection packages. Use native GestureDetector + HardwareKeyboard.
+
+V1.1 Selection & UI Rules
+selectedPhotos is the single source of truth for selection.
+
+Ctrl-Click toggles individual photos.
+
+Shift-Click range selects from _lastClickedIndex.
+
+Session Tagged Badge: Tracked via _processedFiles Set in memory. Cleared on folder load. 20x20px green (#1D9E75) circle badge with white checkmark overlay on top right of thumbnail.
+
+Strict Instructions
+Never suggest Linux/Mac paths. Never touch Title, ObjectName, DateTimeOriginal metadata. Ensure zero lint warnings.
+
+Composer Prompt 2: Execute V1.1
+Once the rules are saved, open lib/main.dart and ROADMAP.md. Open Composer (Cmd+I) and paste this:
+
+@ROADMAP.md @.cursorrules @lib/main.dart
+We are executing the two V1.1 features from our roadmap: "Native Multi-Select" and "Session Tagged Badge".
+
+Task 1: Session Tagged Badge
+
+Implement final Set<String> _processedFiles = {}; to track successful ExifTool injections for the current session.
+
+Clear this set when a new folder is loaded. Add paths to this set when Process.run returns exitCode == 0.
+
+Overlay a green checkmark badge (per the .cursorrules spec) on the thumbnails of processed files. This badge must render on top of any selection borders.
+
+Task 2: Native Multi-Select
+
+Implement int? _lastClickedIndex; to track range selections.
+
+Update the thumbnail GestureDetector to support HardwareKeyboard modifiers:
+
+Ctrl-Click: Toggle the file in/out of selectedPhotos.
+
+Shift-Click: Select all files between _lastClickedIndex and the current index.
+
+Normal Click: Clear selection, select only the clicked file, and manage the anchor state exactly as it currently does.
+
+Do not import any third-party grid selection packages. Use native Flutter implementations. Do not break the existing anchor state logic or the Scan/Assign button gating.
+
+Build & Run Sequence
+Dev Testing: Use flutter run -d windows or the IDE Debugger for testing UI and state logic.
+
+Production Testing: NEVER trust Directory.current in dev mode. ALWAYS test ExifTool injections by running the compiled CaptionFast.exe in the Release folder.
+
+Build Command: flutter build windows --release
+
+Installer Compilation: After building the release, open frontend/captionfast.iss in Inno Setup Compiler and compile to generate the final setup executable.
