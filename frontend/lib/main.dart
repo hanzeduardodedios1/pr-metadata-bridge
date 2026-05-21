@@ -6,12 +6,10 @@ import 'package:file_picker/file_picker.dart';
 import 'package:flutter/foundation.dart';
 import 'package:flutter/material.dart';
 import 'package:flutter/services.dart';
-import 'package:flutter_riverpod/flutter_riverpod.dart';
 import 'package:http/http.dart' as http;
 import 'package:shared_preferences/shared_preferences.dart';
 import 'package:http_parser/http_parser.dart';
 import 'package:path/path.dart' as p;
-import 'package:path_provider/path_provider.dart';
 import 'package:url_launcher/url_launcher.dart';
 import 'package:window_manager/window_manager.dart';
 
@@ -39,15 +37,9 @@ const double _kPanelTitleFontSize = 18;
 
 const String _kPrefLicenseKey = 'license_key';
 const String _kPrefLicenseValidated = 'license_validated';
-// TEMP: bypass LemonSqueezy gate for local V1.1 UI testing. Set to false when store is approved.
-const bool _kBypassLicenseGate = true;
-const String _kDevLicenseKeyPlaceholder = 'dev-bypass-local-test';
+const String _kProxyApiKey = 'cf_live_83920_auth_key';
 final Uri _kLemonSqueezyValidateUri = Uri.parse(
   'https://api.lemonsqueezy.com/v1/licenses/validate',
-);
-
-final backendHostProvider = ChangeNotifierProvider<BackendHostController>(
-  (ref) => throw StateError('backendHostProvider must be overridden in main()'),
 );
 
 Never _fatalProxyUrlInvalid([Object? cause]) {
@@ -179,7 +171,7 @@ class BackendHostController extends ChangeNotifier {
     notifyListeners();
   }
 
-  /// Polls [pingBackendHealth] until success or [_kHealthWaitTimeout] elapses.
+  /// Polls [pingBackendHealth] until success or the health wait timeout elapses.
   Future<bool> waitForBackendHttpReady() async {
     _canSendHttp = true;
     _bootstrapMessage = null;
@@ -256,171 +248,8 @@ Future<void> main() async {
 
   final backendHost = BackendHostController();
 
-  runApp(
-    ProviderScope(
-      overrides: [backendHostProvider.overrideWith((ref) => backendHost)],
-      child: const App(),
-    ),
-  );
+  runApp(App(backendHost: backendHost));
 }
-
-class ImagePathsNotifier extends StateNotifier<List<String>> {
-  ImagePathsNotifier() : super(const []);
-
-  String _normalizePath(String rawPath) => p.normalize(rawPath);
-
-  /// Last folder passed to [loadJpegsFromDirectory], used for refresh and breadcrumb.
-  String? get currentLoadDirectory => _currentLoadDirectory;
-  String? _currentLoadDirectory;
-
-  Future<bool> pickFolderAndLoadJpegs() async {
-    final selectedDirectory = await FilePicker.platform.getDirectoryPath(
-      dialogTitle: 'Select Folder with JPEG Images',
-    );
-    if (selectedDirectory == null) {
-      return false;
-    }
-
-    loadJpegsFromDirectory(selectedDirectory);
-    return true;
-  }
-
-  void loadJpegsFromDirectory(String selectedDirectory) {
-    _currentLoadDirectory = _normalizePath(selectedDirectory);
-    final directory = Directory(_currentLoadDirectory!);
-    final files =
-        directory
-            .listSync()
-            .whereType<File>()
-            .where((file) => _isJpeg(file.path))
-            .map((file) => _normalizePath(file.path))
-            .toList()
-          ..sort();
-
-    state = files;
-  }
-
-  bool _isJpeg(String filePath) {
-    final ext = p.extension(filePath).toLowerCase();
-    return ext == '.jpg' || ext == '.jpeg';
-  }
-
-  void clear() {
-    _currentLoadDirectory = null;
-    state = const [];
-  }
-}
-
-class SelectedImagesNotifier extends StateNotifier<Set<String>> {
-  SelectedImagesNotifier() : super(<String>{});
-
-  String _normalizePath(String rawPath) => p.normalize(rawPath);
-
-  void toggle(String filePath) {
-    final normalizedPath = _normalizePath(filePath);
-    final next = {...state};
-    if (next.contains(normalizedPath)) {
-      next.remove(normalizedPath);
-    } else {
-      next.add(normalizedPath);
-    }
-    state = next;
-  }
-
-  void selectOnly(String filePath) {
-    state = {_normalizePath(filePath)};
-  }
-
-  void selectRange(List<String> imagePaths, int fromIndex, int toIndex) {
-    final low = fromIndex < toIndex ? fromIndex : toIndex;
-    final high = fromIndex > toIndex ? fromIndex : toIndex;
-    final next = <String>{};
-    for (var i = low; i <= high; i++) {
-      if (i >= 0 && i < imagePaths.length) {
-        next.add(_normalizePath(imagePaths[i]));
-      }
-    }
-    state = next;
-  }
-
-  void clear() {
-    state = <String>{};
-  }
-
-  void keepOnlyPaths(Set<String> validPaths) {
-    final next = {
-      for (final p in state)
-        if (validPaths.contains(p)) p,
-    };
-    if (next.length == state.length) {
-      return;
-    }
-    state = next;
-  }
-}
-
-class TagsNotifier extends StateNotifier<Map<String, String>> {
-  TagsNotifier() : super(<String, String>{});
-
-  String _normalizePath(String rawPath) => p.normalize(rawPath);
-
-  void assignTagToSelection({
-    required Set<String> selectedPaths,
-    required String vipName,
-  }) {
-    if (vipName.trim().isEmpty || selectedPaths.isEmpty) {
-      return;
-    }
-
-    final normalizedVip = vipName.trim();
-    final next = {...state};
-    for (final filePath in selectedPaths) {
-      next[_normalizePath(filePath)] = normalizedVip;
-    }
-    state = next;
-  }
-
-  Map<String, String> filenameToVipMap() {
-    return {
-      for (final entry in state.entries) p.basename(entry.key): entry.value,
-    };
-  }
-
-  void clear() {
-    state = <String, String>{};
-  }
-
-  void keepOnlyPathsWithTags(Set<String> validPaths) {
-    final next = {
-      for (final e in state.entries)
-        if (validPaths.contains(e.key)) e.key: e.value,
-    };
-    if (next.length == state.length) {
-      return;
-    }
-    state = next;
-  }
-}
-
-final loadedFilesProvider =
-    StateNotifierProvider<ImagePathsNotifier, List<String>>(
-      (ref) => ImagePathsNotifier(),
-    );
-
-final selectedFilesProvider =
-    StateNotifierProvider<SelectedImagesNotifier, Set<String>>(
-      (ref) => SelectedImagesNotifier(),
-    );
-
-final taggedFilesProvider =
-    StateNotifierProvider<TagsNotifier, Map<String, String>>(
-      (ref) => TagsNotifier(),
-    );
-
-// Backward-compatible aliases for existing references.
-final imagePathsProvider = loadedFilesProvider;
-final selectedImagesProvider = selectedFilesProvider;
-final tagsProvider = taggedFilesProvider;
 
 String get _resolvedExifToolPath {
   if (kDebugMode) {
@@ -432,15 +261,16 @@ String get _resolvedExifToolPath {
   );
 }
 
-class App extends ConsumerStatefulWidget {
-  const App({super.key});
+class App extends StatefulWidget {
+  const App({required this.backendHost, super.key});
+
+  final BackendHostController backendHost;
 
   @override
-  ConsumerState<App> createState() => _AppState();
+  State<App> createState() => _AppState();
 }
 
-class _AppState extends ConsumerState<App>
-    with WindowListener, WidgetsBindingObserver {
+class _AppState extends State<App> with WindowListener, WidgetsBindingObserver {
   static bool get _manageWindowClose => !kIsWeb && Platform.isWindows;
   bool _isShuttingDown = false;
 
@@ -483,8 +313,8 @@ class _AppState extends ConsumerState<App>
     }
     _isShuttingDown = true;
     try {
-      ref.read(backendHostProvider).requestOwnedProcessKill();
-      await ref.read(backendHostProvider).shutdownOwned();
+      widget.backendHost.requestOwnedProcessKill();
+      await widget.backendHost.shutdownOwned();
       if (_manageWindowClose) {
         await windowManager.setPreventClose(false);
       }
@@ -588,7 +418,10 @@ class _AppState extends ConsumerState<App>
           ),
         ),
       ),
-      home: const StartupGate(child: HomePage()),
+      home: StartupGate(
+        backendHost: widget.backendHost,
+        child: HomePage(backendHost: widget.backendHost),
+      ),
     );
   }
 }
@@ -596,16 +429,21 @@ class _AppState extends ConsumerState<App>
 enum _StartupGatePhase { loading, ready }
 
 /// Runs startup checks before revealing [child].
-class StartupGate extends ConsumerStatefulWidget {
-  const StartupGate({required this.child, super.key});
+class StartupGate extends StatefulWidget {
+  const StartupGate({
+    required this.backendHost,
+    required this.child,
+    super.key,
+  });
 
+  final BackendHostController backendHost;
   final Widget child;
 
   @override
-  ConsumerState<StartupGate> createState() => _StartupGateState();
+  State<StartupGate> createState() => _StartupGateState();
 }
 
-class _StartupGateState extends ConsumerState<StartupGate> {
+class _StartupGateState extends State<StartupGate> {
   static const List<String> _kStartupStatusMessages = <String>[
     'Starting up...',
     'Connecting to Vision API...',
@@ -649,7 +487,7 @@ class _StartupGateState extends ConsumerState<StartupGate> {
       return;
     }
 
-    await ref.read(backendHostProvider).bootstrap();
+    await widget.backendHost.bootstrap();
     _statusTimer?.cancel();
     setState(() {
       _statusMessageIndex = 2;
@@ -972,14 +810,28 @@ class _DashedBorderPainter extends CustomPainter {
   }
 }
 
-class HomePage extends ConsumerStatefulWidget {
-  const HomePage({super.key});
+class HomePage extends StatefulWidget {
+  const HomePage({
+    required this.backendHost,
+    super.key,
+    @visibleForTesting this.initialPhotoPaths,
+    @visibleForTesting this.initialLicenseValid,
+  });
+
+  final BackendHostController backendHost;
+
+  @visibleForTesting
+  final List<String>? initialPhotoPaths;
+
+  @visibleForTesting
+  final bool? initialLicenseValid;
 
   @override
-  ConsumerState<HomePage> createState() => _HomePageState();
+  State<HomePage> createState() => HomePageState();
 }
 
-class _HomePageState extends ConsumerState<HomePage> {
+@visibleForTesting
+class HomePageState extends State<HomePage> {
   static Uri get _scanUri => _kProxyScanUri;
   static const Set<String> _scanFailureTokens = {
     'ERROR_READING_TEXT',
@@ -998,138 +850,327 @@ class _HomePageState extends ConsumerState<HomePage> {
   bool _isScanning = false;
   bool _isProcessingBatch = false;
   bool _showProcessSuccess = false;
-  String? _scannedAnchorPath;
+  String? _anchorPath;
   Timer? _processSuccessTimer;
-  String? _licenseKey;
+  String? licensekey;
+  bool islicensevalid = false;
+  bool islicenseverifying = false;
+  List<String> _imagePaths = const [];
+  String? _currentLoadDirectory;
+  Set<String> _selectedPhotos = {};
+  Map<String, String> _tags = {};
   final Set<String> _processedFiles = {};
-  final Map<String, String> _sessionResults = {};
+  /// Filename → subject written by ExifTool this session (roster CSV export).
+  final Map<String, String> _sessionTags = {};
   int? _lastClickedIndex;
   Set<String> _vipList = {};
   bool _isAnchorVipMatch = false;
 
+  @visibleForTesting
+  Set<String> get selectedPhotos => Set.unmodifiable(_selectedPhotos);
+
+  @visibleForTesting
+  String? get anchorPath => _anchorPath;
+  final ScrollController _gridScrollController = ScrollController();
+  Offset? _dragStart;
+  Offset? _dragCurrent;
+  Offset? _lassoPointerDown;
+  int _gridCrossAxisCount = 2;
+  double _gridViewportWidth = 0;
+  static const double _kLassoActivationDistance = 8;
+
   @override
   void initState() {
     super.initState();
-    _loadLicenseFromPreferences();
-  }
-
-  String? get _effectiveLicenseKey {
-    if (_kBypassLicenseGate) {
-      return _kDevLicenseKeyPlaceholder;
+    final seeded = widget.initialPhotoPaths;
+    if (seeded != null) {
+      _imagePaths = List<String>.from(seeded);
     }
-    final key = _licenseKey?.trim();
-    return key == null || key.isEmpty ? null : key;
+    if (widget.initialLicenseValid == true) {
+      licensekey = 'test-license';
+      islicensevalid = true;
+      islicenseverifying = false;
+    } else {
+      unawaited(_loadLicenseFromPreferences());
+    }
   }
 
-  Future<void> _loadLicenseFromPreferences() async {
+  String _normalizePath(String rawPath) => p.normalize(rawPath);
+
+  bool _isJpeg(String filePath) {
+    final ext = p.extension(filePath).toLowerCase();
+    return ext == '.jpg' || ext == '.jpeg';
+  }
+
+  List<String> _listJpegsInDirectory(String directoryPath) {
+    final directory = Directory(directoryPath);
+    final files =
+        directory
+            .listSync()
+            .whereType<File>()
+            .where((file) => _isJpeg(file.path))
+            .map((file) => _normalizePath(file.path))
+            .toList()
+      ..sort();
+    return files;
+  }
+
+  void _resetSessionForNewFolder() {
+    _selectedPhotos = {};
+    _anchorPath = null;
+    _tagController.clear();
+    _processedFiles.clear();
+    _sessionTags.clear();
+    _tags = {};
+    _lastClickedIndex = null;
+    _isAnchorVipMatch = false;
+    _showProcessSuccess = false;
+  }
+
+  void _loadJpegsFromDirectory(String selectedDirectory) {
+    _currentLoadDirectory = _normalizePath(selectedDirectory);
+    _imagePaths = _listJpegsInDirectory(_currentLoadDirectory!);
+  }
+
+  Future<bool> _pickFolderAndLoadJpegs() async {
+    final selectedDirectory = await FilePicker.platform.getDirectoryPath(
+      dialogTitle: 'Select Folder with JPEG Images',
+    );
+    if (selectedDirectory == null) {
+      return false;
+    }
+    setState(() {
+      _resetSessionForNewFolder();
+      _loadJpegsFromDirectory(selectedDirectory);
+    });
+    return true;
+  }
+
+  void _toggleSelection(String filePath) {
+    final normalizedPath = _normalizePath(filePath);
+    final next = {..._selectedPhotos};
+    if (next.contains(normalizedPath)) {
+      next.remove(normalizedPath);
+    } else {
+      next.add(normalizedPath);
+    }
+    _selectedPhotos = next;
+  }
+
+  void _selectRange(int fromIndex, int toIndex) {
+    final low = fromIndex < toIndex ? fromIndex : toIndex;
+    final high = fromIndex > toIndex ? fromIndex : toIndex;
+    final next = <String>{};
+    for (var i = low; i <= high; i++) {
+      if (i >= 0 && i < _imagePaths.length) {
+        next.add(_normalizePath(_imagePaths[i]));
+      }
+    }
+    _selectedPhotos = next;
+  }
+
+  void _addSelectedPaths(Iterable<String> filePaths) {
+    final next = {..._selectedPhotos};
+    var changed = false;
+    for (final filePath in filePaths) {
+      if (next.add(_normalizePath(filePath))) {
+        changed = true;
+      }
+    }
+    if (changed) {
+      _selectedPhotos = next;
+    }
+  }
+
+  Future<({bool valid, String message})> _verifyLicenseKey(String key) async {
+    try {
+      final response = await http
+          .post(
+            _kLemonSqueezyValidateUri,
+            headers: const {
+              'Accept': 'application/json',
+              'Content-Type': 'application/json',
+            },
+            body: jsonEncode(<String, String>{'license_key': key}),
+          )
+          .timeout(const Duration(seconds: 25));
+      Map<String, dynamic>? bodyMap;
+      try {
+        final decoded = jsonDecode(response.body);
+        bodyMap = decoded is Map<String, dynamic> ? decoded : null;
+      } on FormatException {
+        bodyMap = null;
+      }
+
+      final valid = bodyMap?['valid'] == true;
+      if (response.statusCode == 200 && valid) {
+        final licenseInfo = bodyMap?['license_key'];
+        if (licenseInfo is Map<String, dynamic>) {
+          final status = (licenseInfo['status'] as String? ?? '').toLowerCase();
+          if (status == 'inactive' ||
+              status == 'expired' ||
+              status == 'disabled') {
+            return (
+              valid: false,
+              message: 'License is $status. Please renew or contact support.',
+            );
+          }
+        }
+        return (valid: true, message: '');
+      }
+
+      final err = bodyMap?['error'];
+      if (err is String && err.isNotEmpty) {
+        return (valid: false, message: err);
+      }
+      if (bodyMap?['valid'] == false) {
+        return (
+          valid: false,
+          message: 'Invalid license key. Please check your purchase email.',
+        );
+      }
+      return (
+        valid: false,
+        message: 'Could not validate. Check your connection and try again.',
+      );
+    } on Object {
+      return (
+        valid: false,
+        message: 'Could not validate. Check your connection and try again.',
+      );
+    }
+  }
+
+  Future<void> _persistLicenseKey(String key) async {
     final prefs = await SharedPreferences.getInstance();
-    final key = prefs.getString(_kPrefLicenseKey);
+    await prefs.setString(_kPrefLicenseKey, key);
+    await prefs.setBool(_kPrefLicenseValidated, true);
+  }
+
+  Future<void> _clearLicenseFromPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    await prefs.remove(_kPrefLicenseKey);
+    await prefs.setBool(_kPrefLicenseValidated, false);
+  }
+
+  Future<void> _invalidateLicense(String message) async {
+    await _clearLicenseFromPreferences();
     if (!mounted) {
       return;
     }
     setState(() {
-      // When bypass is on, treat license as valid so scan/UI flow is not blocked.
-      _licenseKey = _kBypassLicenseGate ? _kDevLicenseKeyPlaceholder : key;
+      licensekey = null;
+      islicensevalid = false;
+      islicenseverifying = false;
+    });
+    _showErrorSnackBar(message);
+    await _showLicenseDialog();
+  }
+
+  Future<void> _loadLicenseFromPreferences() async {
+    final prefs = await SharedPreferences.getInstance();
+    final key = prefs.getString(_kPrefLicenseKey)?.trim();
+    if (!mounted) {
+      return;
+    }
+    if (key == null || key.isEmpty) {
+      setState(() {
+        licensekey = null;
+        islicensevalid = false;
+        islicenseverifying = false;
+      });
+      return;
+    }
+
+    setState(() {
+      licensekey = key;
+      islicensevalid = false;
+      islicenseverifying = true;
+    });
+
+    final result = await _verifyLicenseKey(key);
+    if (!mounted) {
+      return;
+    }
+    if (result.valid) {
+      setState(() {
+        islicensevalid = true;
+        islicenseverifying = false;
+      });
+      return;
+    }
+
+    await _clearLicenseFromPreferences();
+    if (!mounted) {
+      return;
+    }
+    setState(() {
+      licensekey = null;
+      islicensevalid = false;
+      islicenseverifying = false;
     });
   }
 
   Future<void> _showLicenseDialog() async {
-    final controller = TextEditingController(text: _licenseKey ?? '');
-    String? dialogError;
+    final controller = TextEditingController(text: licensekey ?? '');
+    final messenger = ScaffoldMessenger.of(context);
+    String? dialogerror;
     var submitting = false;
 
     await showDialog<void>(
       context: context,
-      barrierDismissible: !submitting,
+      barrierDismissible: false,
       builder: (dialogContext) {
         return StatefulBuilder(
           builder: (context, setDialogState) {
             Future<void> submit() async {
-              final enteredKey = controller.text.trim();
-              if (enteredKey.isEmpty) {
+              final enteredkey = controller.text.trim();
+              if (enteredkey.isEmpty) {
                 setDialogState(() {
-                  dialogError = 'Please enter a license key.';
+                  dialogerror = 'Please enter a license key.';
                 });
                 return;
               }
               setDialogState(() {
                 submitting = true;
-                dialogError = null;
+                dialogerror = null;
               });
-              http.Response response;
-              try {
-                response = await http
-                    .post(
-                      _kLemonSqueezyValidateUri,
-                      headers: const {
-                        'Accept': 'application/json',
-                        'Content-Type': 'application/json',
-                      },
-                      body: jsonEncode(<String, String>{
-                        'license_key': enteredKey,
-                      }),
-                    )
-                    .timeout(const Duration(seconds: 25));
-              } on Object catch (_) {
-                setDialogState(() {
-                  submitting = false;
-                  dialogError =
-                      'Could not validate. Check your connection and try again.';
-                });
+
+              final result = await _verifyLicenseKey(enteredkey);
+              if (!dialogContext.mounted) {
                 return;
               }
 
-              Map<String, dynamic>? bodyMap;
-              try {
-                final decoded = jsonDecode(response.body);
-                bodyMap = decoded is Map<String, dynamic> ? decoded : null;
-              } on FormatException {
-                bodyMap = null;
-              }
-
-              final valid = bodyMap?['valid'] == true;
-              final explicitInvalid = bodyMap?['valid'] == false;
-
-              if (response.statusCode == 200 && valid) {
-                final prefs = await SharedPreferences.getInstance();
-                await prefs.setString(_kPrefLicenseKey, enteredKey);
-                await prefs.setBool(_kPrefLicenseValidated, true);
+              if (result.valid) {
+                await _persistLicenseKey(enteredkey);
+                if (!dialogContext.mounted) {
+                  return;
+                }
+                Navigator.of(dialogContext).pop();
                 if (!mounted) {
                   return;
                 }
                 setState(() {
-                  _licenseKey = enteredKey;
+                  licensekey = enteredkey;
+                  islicensevalid = true;
+                  islicenseverifying = false;
                 });
-                if (dialogContext.mounted) {
-                  Navigator.of(dialogContext).pop();
-                }
-                if (!context.mounted) {
-                  return;
-                }
-                ScaffoldMessenger.of(context).showSnackBar(
+                messenger.showSnackBar(
                   const SnackBar(
                     content: Text('License activated successfully'),
                     behavior: SnackBarBehavior.floating,
                   ),
                 );
-              } else if (explicitInvalid ||
-                  (response.statusCode == 200 && bodyMap != null && !valid)) {
-                setDialogState(() {
-                  submitting = false;
-                  dialogError =
-                      'Invalid license key. Please check your purchase email.';
-                });
               } else {
                 setDialogState(() {
                   submitting = false;
-                  dialogError =
-                      'Could not validate. Check your connection and try again.';
+                  dialogerror = result.message;
                 });
               }
             }
 
             return AlertDialog(
-              title: const Text('License Key'),
+              title: const Text('Enter License Key'),
               content: SingleChildScrollView(
                 child: Column(
                   mainAxisSize: MainAxisSize.min,
@@ -1148,7 +1189,7 @@ class _HomePageState extends ConsumerState<HomePage> {
                       enabled: !submitting,
                       decoration: InputDecoration(
                         hintText: 'License key',
-                        errorText: dialogError,
+                        errorText: dialogerror,
                         border: const OutlineInputBorder(),
                       ),
                       style: const TextStyle(fontSize: _kInputFontSize),
@@ -1158,12 +1199,6 @@ class _HomePageState extends ConsumerState<HomePage> {
               ),
               actions: [
                 TextButton(
-                  onPressed: submitting
-                      ? null
-                      : () => Navigator.of(dialogContext).pop(),
-                  child: const Text('Cancel'),
-                ),
-                TextButton(
                   onPressed: submitting ? null : submit,
                   child: submitting
                       ? const SizedBox(
@@ -1171,7 +1206,7 @@ class _HomePageState extends ConsumerState<HomePage> {
                           width: 18,
                           child: CircularProgressIndicator(strokeWidth: 2),
                         )
-                      : const Text('Submit'),
+                      : const Text('Activate'),
                 ),
               ],
             );
@@ -1182,11 +1217,213 @@ class _HomePageState extends ConsumerState<HomePage> {
     controller.dispose();
   }
 
+  Widget _buildLicenseGateOverlay() {
+    if (islicenseverifying) {
+      return const ColoredBox(
+        color: Color(0xCC1E1E1E),
+        child: Center(
+          child: Column(
+            mainAxisSize: MainAxisSize.min,
+            children: [
+              SizedBox(
+                width: 32,
+                height: 32,
+                child: CircularProgressIndicator(
+                  strokeWidth: 2.5,
+                  color: _kBrutalistButton,
+                ),
+              ),
+              SizedBox(height: 16),
+              Text(
+                'Verifying license...',
+                style: TextStyle(
+                  fontSize: _kInputFontSize,
+                  color: _kBrutalistSecondaryText,
+                ),
+              ),
+            ],
+          ),
+        ),
+      );
+    }
+
+    if (!islicensevalid) {
+      return ColoredBox(
+        color: const Color(0xCC1E1E1E),
+        child: Center(
+          child: ConstrainedBox(
+            constraints: const BoxConstraints(maxWidth: 420),
+            child: Padding(
+              padding: const EdgeInsets.all(24),
+              child: Column(
+                mainAxisSize: MainAxisSize.min,
+                children: [
+                  const Icon(
+                    Icons.vpn_key_outlined,
+                    size: 48,
+                    color: _kBrutalistButton,
+                  ),
+                  const SizedBox(height: 16),
+                  const Text(
+                    'Enter License Key',
+                    style: TextStyle(
+                      fontSize: _kPanelTitleFontSize,
+                      fontWeight: FontWeight.w600,
+                      color: _kBrutalistPrimaryText,
+                    ),
+                  ),
+                  const SizedBox(height: 8),
+                  const Text(
+                    'A valid license is required to use cloud scan.',
+                    textAlign: TextAlign.center,
+                    style: TextStyle(
+                      fontSize: _kInputFontSize,
+                      color: _kBrutalistSecondaryText,
+                    ),
+                  ),
+                  const SizedBox(height: 20),
+                  SizedBox(
+                    width: double.infinity,
+                    child: _PrimaryActionButton(
+                      onPressed: _showLicenseDialog,
+                      child: const Text('Enter License Key'),
+                    ),
+                  ),
+                ],
+              ),
+            ),
+          ),
+        ),
+      );
+    }
+
+    return const SizedBox.shrink();
+  }
+
   @override
   void dispose() {
     _processSuccessTimer?.cancel();
     _tagController.dispose();
+    _gridScrollController.dispose();
     super.dispose();
+  }
+
+  static const double _kGridCrossAxisSpacing = 12;
+  static const double _kGridMainAxisSpacing = 12;
+  static const double _kGridChildAspectRatio = 0.88;
+
+  int _crossAxisCountForGridWidth(double maxWidth) {
+    return (maxWidth / 220).floor().clamp(2, 8);
+  }
+
+  double _crossAxisExtentForGrid(double gridWidth, int crossAxisCount) {
+    return (gridWidth - (crossAxisCount - 1) * _kGridCrossAxisSpacing) /
+        crossAxisCount;
+  }
+
+  double _mainAxisExtentForGrid(double gridWidth, int crossAxisCount) {
+    return _crossAxisExtentForGrid(gridWidth, crossAxisCount) /
+        _kGridChildAspectRatio;
+  }
+
+  Rect _thumbnailRectAtIndex({
+    required int index,
+    required int crossAxisCount,
+    required double gridWidth,
+    required double scrollOffset,
+  }) {
+    final crossAxisExtent = _crossAxisExtentForGrid(gridWidth, crossAxisCount);
+    final mainAxisExtent = _mainAxisExtentForGrid(gridWidth, crossAxisCount);
+    final col = index % crossAxisCount;
+    final row = index ~/ crossAxisCount;
+    final left = col * (crossAxisExtent + _kGridCrossAxisSpacing);
+    final top = row * (mainAxisExtent + _kGridMainAxisSpacing) - scrollOffset;
+    return Rect.fromLTWH(left, top, crossAxisExtent, mainAxisExtent);
+  }
+
+  Iterable<int> _thumbnailIndicesInSelectionRect(
+    Rect selectionRect, {
+    required int itemCount,
+    required int crossAxisCount,
+    required double gridWidth,
+    required double scrollOffset,
+  }) sync* {
+    for (var index = 0; index < itemCount; index++) {
+      final thumbRect = _thumbnailRectAtIndex(
+        index: index,
+        crossAxisCount: crossAxisCount,
+        gridWidth: gridWidth,
+        scrollOffset: scrollOffset,
+      );
+      if (selectionRect.overlaps(thumbRect)) {
+        yield index;
+      }
+    }
+  }
+
+  void _applyLassoSelection(List<String> imagePaths) {
+    if (_dragStart == null || _dragCurrent == null || imagePaths.isEmpty) {
+      return;
+    }
+    final selectionRect = Rect.fromPoints(_dragStart!, _dragCurrent!);
+    final scrollOffset = _gridScrollController.hasClients
+        ? _gridScrollController.offset
+        : 0.0;
+    final indices = _thumbnailIndicesInSelectionRect(
+      selectionRect,
+      itemCount: imagePaths.length,
+      crossAxisCount: _gridCrossAxisCount,
+      gridWidth: _gridViewportWidth,
+      scrollOffset: scrollOffset,
+    );
+    final paths = [
+      for (final index in indices)
+        if (index >= 0 && index < imagePaths.length) imagePaths[index],
+    ];
+    setState(() => _addSelectedPaths(paths));
+  }
+
+  void _onGridPanStart(DragStartDetails details) {
+    _lassoPointerDown = details.localPosition;
+  }
+
+  void _onGridPanUpdate(DragUpdateDetails details, List<String> imagePaths) {
+    final pointerDown = _lassoPointerDown;
+    if (pointerDown == null) {
+      return;
+    }
+
+    if (_dragStart == null) {
+      if ((details.localPosition - pointerDown).distance <
+          _kLassoActivationDistance) {
+        return;
+      }
+      setState(() {
+        _dragStart = pointerDown;
+        _dragCurrent = details.localPosition;
+      });
+    } else {
+      setState(() {
+        _dragCurrent = details.localPosition;
+      });
+    }
+    _applyLassoSelection(imagePaths);
+  }
+
+  void _onGridPanEnd(DragEndDetails details) {
+    setState(() {
+      _dragStart = null;
+      _dragCurrent = null;
+      _lassoPointerDown = null;
+    });
+  }
+
+  void _onGridPanCancel() {
+    setState(() {
+      _dragStart = null;
+      _dragCurrent = null;
+      _lassoPointerDown = null;
+    });
   }
 
   bool _isVipName(String name) {
@@ -1256,14 +1493,17 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   void _assignTag() {
     // Always use the live field text at tap time, never a stale scan/OCR value.
-    final subjectFromField = _tagController.text;
-    final selectedPaths = ref.read(selectedFilesProvider);
-    ref
-        .read(taggedFilesProvider.notifier)
-        .assignTagToSelection(
-          selectedPaths: selectedPaths,
-          vipName: subjectFromField,
-        );
+    final subjectFromField = _tagController.text.trim();
+    if (subjectFromField.isEmpty || _selectedPhotos.isEmpty) {
+      return;
+    }
+    setState(() {
+      final next = {..._tags};
+      for (final filePath in _selectedPhotos) {
+        next[_normalizePath(filePath)] = subjectFromField;
+      }
+      _tags = next;
+    });
   }
 
   void _process() {
@@ -1299,14 +1539,26 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   void _refreshCurrentFolder() {
-    final dir = ref.read(loadedFilesProvider.notifier).currentLoadDirectory;
+    final dir = _currentLoadDirectory;
     if (dir == null) {
       return;
     }
-    ref.read(loadedFilesProvider.notifier).loadJpegsFromDirectory(dir);
-    final valid = ref.read(loadedFilesProvider).toSet();
-    ref.read(selectedFilesProvider.notifier).keepOnlyPaths(valid);
-    ref.read(taggedFilesProvider.notifier).keepOnlyPathsWithTags(valid);
+    final files = _listJpegsInDirectory(dir);
+    final valid = files.toSet();
+    setState(() {
+      _imagePaths = files;
+      _selectedPhotos = {
+        for (final path in _selectedPhotos)
+          if (valid.contains(path)) path,
+      };
+      _tags = {
+        for (final entry in _tags.entries)
+          if (valid.contains(entry.key)) entry.key: entry.value,
+      };
+      if (_anchorPath != null && !valid.contains(_anchorPath)) {
+        _anchorPath = null;
+      }
+    });
   }
 
   Future<void> _openBetaFeedbackEmail() async {
@@ -1327,12 +1579,6 @@ class _HomePageState extends ConsumerState<HomePage> {
     await launchUrl(uri);
   }
 
-  void _clearSessionProcessedFiles() {
-    _processedFiles.clear();
-    _sessionResults.clear();
-    _lastClickedIndex = null;
-  }
-
   String _escapeCsvField(String value) {
     if (value.contains('"') ||
         value.contains(',') ||
@@ -1343,59 +1589,58 @@ class _HomePageState extends ConsumerState<HomePage> {
     return value;
   }
 
-  String _buildCsvContent() {
-    final buffer = StringBuffer()..writeln('Filename,Extracted Name');
-    final sortedPaths = _sessionResults.keys.toList()..sort();
-    for (final filePath in sortedPaths) {
-      final filename = p.basename(filePath);
-      final extractedName = _sessionResults[filePath] ?? '';
+  String _buildRosterCsvContent() {
+    final buffer = StringBuffer()..writeln('Filename,Tagged Subject');
+    final sortedFilenames = _sessionTags.keys.toList()..sort();
+    for (final filename in sortedFilenames) {
+      final taggedSubject = _sessionTags[filename] ?? '';
       buffer.writeln(
-        '${_escapeCsvField(filename)},${_escapeCsvField(extractedName)}',
+        '${_escapeCsvField(filename)},${_escapeCsvField(taggedSubject)}',
       );
     }
     return buffer.toString();
   }
 
-  String _formatExportTimestamp(DateTime dateTime) {
-    String two(int value) => value.toString().padLeft(2, '0');
-    return '${dateTime.year}${two(dateTime.month)}${two(dateTime.day)}_'
-        '${two(dateTime.hour)}${two(dateTime.minute)}${two(dateTime.second)}';
+  String? _activeImageDirectory(
+    List<String> imagePaths,
+    String? currentLoadDirectory,
+  ) {
+    if (currentLoadDirectory != null && currentLoadDirectory.isNotEmpty) {
+      return p.normalize(currentLoadDirectory);
+    }
+    if (imagePaths.isNotEmpty) {
+      return p.normalize(p.dirname(imagePaths.first));
+    }
+    return null;
   }
 
-  Future<void> _exportToCSV() async {
-    if (_sessionResults.isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('No processed photos to export yet.'),
-          behavior: SnackBarBehavior.floating,
-        ),
-      );
+  Future<void> _exportRosterCsv(
+    List<String> imagePaths,
+    String? currentLoadDirectory,
+  ) async {
+    if (_sessionTags.isEmpty) {
+      return;
+    }
+
+    final imageDir = _activeImageDirectory(imagePaths, currentLoadDirectory);
+    if (imageDir == null) {
+      if (!mounted) {
+        return;
+      }
+      _showErrorSnackBar('No active image folder to save the roster.');
       return;
     }
 
     try {
-      final downloadsDir = await getDownloadsDirectory();
-      if (downloadsDir == null) {
-        if (!mounted) {
-          return;
-        }
-        _showErrorSnackBar('Could not locate your Downloads folder.');
-        return;
-      }
-
-      final timestamp = _formatExportTimestamp(DateTime.now());
-      final filePath = p.join(
-        downloadsDir.path,
-        'CaptionFast_Export_$timestamp.csv',
-      );
-      await File(filePath).writeAsString(_buildCsvContent());
+      final filePath = p.join(imageDir, 'CaptionFast_Roster.csv');
+      await File(filePath).writeAsString(_buildRosterCsvContent());
 
       if (!mounted) {
         return;
       }
       ScaffoldMessenger.of(context).showSnackBar(
         SnackBar(
-          content: Text('Exported roster to $filePath'),
+          content: Text('Roster saved to $imageDir'),
           behavior: SnackBarBehavior.floating,
         ),
       );
@@ -1403,29 +1648,31 @@ class _HomePageState extends ConsumerState<HomePage> {
       if (!mounted) {
         return;
       }
-      _showErrorSnackBar('CSV export failed: $error');
+      _showErrorSnackBar('Roster export failed: $error');
     }
   }
 
   void _onThumbnailTap(int index, String filePath) {
     final isCtrl = HardwareKeyboard.instance.isControlPressed;
     final isShift = HardwareKeyboard.instance.isShiftPressed;
-    final notifier = ref.read(selectedFilesProvider.notifier);
-    final imagePaths = ref.read(loadedFilesProvider);
+    final normalizedPath = _normalizePath(filePath);
 
-    if (isShift && _lastClickedIndex != null) {
-      notifier.selectRange(imagePaths, _lastClickedIndex!, index);
-    } else if (isCtrl) {
-      notifier.toggle(filePath);
-    } else {
-      notifier.selectOnly(filePath);
-    }
-    setState(() => _lastClickedIndex = index);
+    setState(() {
+      if (isShift && _lastClickedIndex != null) {
+        _selectRange(_lastClickedIndex!, index);
+      } else if (isCtrl) {
+        _toggleSelection(normalizedPath);
+      } else {
+        _anchorPath = normalizedPath;
+        _selectedPhotos = {};
+      }
+      _lastClickedIndex = index;
+    });
   }
 
   void _clearCurrentSelectionAndTags() {
-    ref.read(selectedFilesProvider.notifier).clear();
     setState(() {
+      _selectedPhotos = {};
       _tagController.clear();
       _lastClickedIndex = null;
       _isAnchorVipMatch = false;
@@ -1433,9 +1680,8 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   Future<void> _pickFolderFromBreadcrumb() async {
-    final imagePaths = ref.read(loadedFilesProvider);
-    final tags = ref.read(taggedFilesProvider);
-    final hasUnprocessedTaggedPhotos = imagePaths.isNotEmpty && tags.isNotEmpty;
+    final hasUnprocessedTaggedPhotos =
+        _imagePaths.isNotEmpty && _tags.isNotEmpty;
     if (hasUnprocessedTaggedPhotos) {
       final shouldDiscard = await showDialog<bool>(
         context: context,
@@ -1470,18 +1716,12 @@ class _HomePageState extends ConsumerState<HomePage> {
       return;
     }
 
-    ref.read(loadedFilesProvider.notifier).clear();
-    ref.read(selectedFilesProvider.notifier).clear();
-    ref.read(taggedFilesProvider.notifier).clear();
     setState(() {
-      _showProcessSuccess = false;
-      _tagController.clear();
-      _isAnchorVipMatch = false;
-      _clearSessionProcessedFiles();
+      _resetSessionForNewFolder();
+      _currentLoadDirectory = null;
+      _imagePaths = const [];
+      _loadJpegsFromDirectory(selectedDirectory);
     });
-    ref
-        .read(loadedFilesProvider.notifier)
-        .loadJpegsFromDirectory(selectedDirectory);
   }
 
   void _showProcessSuccessState() {
@@ -1537,52 +1777,31 @@ class _HomePageState extends ConsumerState<HomePage> {
     return MediaType('image', subtype);
   }
 
+  String _scanForbiddenDetail(String body) {
+    try {
+      final decoded = jsonDecode(body);
+      if (decoded is Map<String, dynamic>) {
+        final detail = decoded['detail'];
+        if (detail is String && detail.isNotEmpty) {
+          return detail;
+        }
+      }
+    } on FormatException {
+      // Fall through to generic message.
+    }
+    return 'License rejected. Please enter a valid license key.';
+  }
+
   Future<void> _scanSelectedAnchorPhoto() async {
-    final licenseKey = _effectiveLicenseKey;
-    // Blocking gate — skipped while _kBypassLicenseGate is true.
-    if (!_kBypassLicenseGate &&
-        (licenseKey == null || licenseKey.isEmpty)) {
+    final key = licensekey?.trim();
+    if (!islicensevalid || key == null || key.isEmpty) {
       await _showLicenseDialog();
       return;
     }
 
-    final selectedPaths = ref.read(selectedFilesProvider).toList();
-    if (selectedPaths.length != 1) {
+    final anchorPath = _anchorPath;
+    if (anchorPath == null) {
       return;
-    }
-
-    final selectedPath = selectedPaths.first;
-    if (_scannedAnchorPath != null && _scannedAnchorPath != selectedPath) {
-      final shouldReplace = await showDialog<bool>(
-        context: context,
-        builder: (dialogContext) {
-          return AlertDialog(
-            title: const Text('Replace Anchor?'),
-            content: const Text(
-              'Scanning a new photo will replace the current anchor.\nContinue?',
-            ),
-            actions: [
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(false),
-                child: const Text('Cancel'),
-              ),
-              TextButton(
-                onPressed: () => Navigator.of(dialogContext).pop(true),
-                child: const Text('Continue'),
-              ),
-            ],
-          );
-        },
-      );
-      if (shouldReplace != true) {
-        return;
-      }
-      if (!mounted) {
-        return;
-      }
-      setState(() {
-        _scannedAnchorPath = null;
-      });
     }
 
     setState(() {
@@ -1591,21 +1810,30 @@ class _HomePageState extends ConsumerState<HomePage> {
 
     try {
       debugPrint('Sending scan request to $_scanUri');
-      final imageContentType = _mediaTypeForImagePath(selectedPath);
+      final imageContentType = _mediaTypeForImagePath(anchorPath);
       final requestUri = Uri.parse(_scanUri.toString());
       final request = http.MultipartRequest('POST', requestUri)
         ..files.add(
           await http.MultipartFile.fromPath(
             'file',
-            selectedPath,
+            anchorPath,
             contentType: imageContentType,
           ),
         );
-      request.headers['X-API-Key'] =
-          licenseKey ?? _kDevLicenseKeyPlaceholder;
+      request.headers['X-API-Key'] = _kProxyApiKey;
+      request.headers['X-License-Key'] = key;
       final streamedResponse = await request.send();
       final response = await http.Response.fromStream(streamedResponse);
       debugPrint('Scan response ${response.statusCode}: ${response.body}');
+
+      if (response.statusCode == 403) {
+        final message = _scanForbiddenDetail(response.body);
+        if (!mounted) {
+          return;
+        }
+        await _invalidateLicense(message);
+        return;
+      }
 
       if (response.statusCode != 200) {
         throw Exception(
@@ -1643,7 +1871,6 @@ class _HomePageState extends ConsumerState<HomePage> {
         _tagController.selection = TextSelection.fromPosition(
           TextPosition(offset: _tagController.text.length),
         );
-        _scannedAnchorPath = selectedPath;
         _isAnchorVipMatch = _isVipName(extractedText);
       });
     } on SocketException {
@@ -1671,26 +1898,31 @@ class _HomePageState extends ConsumerState<HomePage> {
   }
 
   Future<void> _processBatch() async {
-    final tags = ref.read(taggedFilesProvider);
+    final tags = _tags;
     if (tags.isEmpty) {
       return;
     }
 
-    final subject = _tagController.text;
-    if (subject.trim().isEmpty) {
-      ScaffoldMessenger.of(context).showSnackBar(
-        const SnackBar(
-          content: Text('Enter a subject name in the field before processing.'),
-        ),
-      );
-      return;
+    final subjectFallback = _tagController.text.trim();
+    final paths = tags.keys.toList()..sort();
+    for (final filePath in paths) {
+      final tagValue = (tags[filePath] ?? subjectFallback).trim();
+      if (tagValue.isEmpty) {
+        ScaffoldMessenger.of(context).showSnackBar(
+          const SnackBar(
+            content: Text(
+              'Every tagged photo needs a subject name. Assign names or enter one in the field.',
+            ),
+          ),
+        );
+        return;
+      }
     }
 
     setState(() {
       _isProcessingBatch = true;
     });
 
-    final paths = tags.keys.toList()..sort();
     try {
       final exifPath = _resolvedExifToolPath;
       var allSucceeded = true;
@@ -1699,13 +1931,13 @@ class _HomePageState extends ConsumerState<HomePage> {
           return;
         }
 
-        final fileSubject = tags[filePath] ?? subject;
+        final tagValue = (tags[filePath] ?? subjectFallback).trim();
         final args = <String>[
-          '-XMP:Subject=${_tagController.text}',
-          '-IPTC:Keywords=${_tagController.text}',
-          '-XPKeywords=${_tagController.text}',
-          '-XPSubject=${_tagController.text}',
-          if (_isVipName(fileSubject)) '-XMP:Rating=5',
+          '-XMP:Subject=$tagValue',
+          '-IPTC:Keywords=$tagValue',
+          '-XPKeywords=$tagValue',
+          '-XPSubject=$tagValue',
+          if (_isVipName(tagValue)) '-XMP:Label=Red',
           '-overwrite_original',
           filePath,
         ];
@@ -1716,7 +1948,7 @@ class _HomePageState extends ConsumerState<HomePage> {
             final normalizedPath = p.normalize(filePath);
             setState(() {
               _processedFiles.add(normalizedPath);
-              _sessionResults[normalizedPath] = subject.trim();
+              _sessionTags[p.basename(normalizedPath)] = tagValue;
             });
           } else {
             allSucceeded = false;
@@ -1751,11 +1983,9 @@ class _HomePageState extends ConsumerState<HomePage> {
       }
 
       if (allSucceeded) {
-        ref.read(selectedFilesProvider.notifier).clear();
         setState(() {
+          _selectedPhotos = {};
           _tagController.clear();
-          _scannedAnchorPath = null;
-          _isAnchorVipMatch = false;
         });
         _showProcessSuccessState();
       }
@@ -1770,21 +2000,23 @@ class _HomePageState extends ConsumerState<HomePage> {
 
   @override
   Widget build(BuildContext context) {
-    final imagePaths = ref.watch(loadedFilesProvider);
-    final selected = ref.watch(selectedFilesProvider);
-    final tags = ref.watch(taggedFilesProvider);
-    final backend = ref.watch(backendHostProvider);
-    final scanTooltip = selected.isEmpty
-        ? 'Select a photo to scan'
-        : selected.length > 1
-        ? 'Select only one photo to scan'
-        : 'Scan this photo for text';
-    final currentLoadDirectory = ref
-        .read(loadedFilesProvider.notifier)
-        .currentLoadDirectory;
+    final imagePaths = _imagePaths;
+    final selected = _selectedPhotos;
+    final tags = _tags;
+    final scanTooltip = _anchorPath == null
+        ? 'Click a photo to set the anchor, then scan'
+        : 'Scan anchor photo for text';
+    final currentLoadDirectory = _currentLoadDirectory;
 
-    return Scaffold(
-      body: Column(
+    return ListenableBuilder(
+      listenable: widget.backendHost,
+      builder: (context, _) {
+        final backend = widget.backendHost;
+        return Scaffold(
+      body: Stack(
+        fit: StackFit.expand,
+        children: [
+          Column(
         crossAxisAlignment: CrossAxisAlignment.stretch,
         children: [
           if (!backend.canSendHttp)
@@ -1885,24 +2117,7 @@ class _HomePageState extends ConsumerState<HomePage> {
                                     ),
                                     child: _DashedBorder(
                                       child: InkWell(
-                                        onTap: () async {
-                                          final loaded = await ref
-                                              .read(
-                                                loadedFilesProvider.notifier,
-                                              )
-                                              .pickFolderAndLoadJpegs();
-                                          if (loaded && mounted) {
-                                            ref
-                                                .read(
-                                                  selectedFilesProvider
-                                                      .notifier,
-                                                )
-                                                .clear();
-                                            setState(
-                                              _clearSessionProcessedFiles,
-                                            );
-                                          }
-                                        },
+                                        onTap: _pickFolderAndLoadJpegs,
                                         child: Container(
                                           width: double.infinity,
                                           padding: const EdgeInsets.symmetric(
@@ -1949,26 +2164,57 @@ class _HomePageState extends ConsumerState<HomePage> {
                               : LayoutBuilder(
                                   builder: (context, constraints) {
                                     final crossAxisCount =
-                                        (constraints.maxWidth / 220)
-                                            .floor()
-                                            .clamp(2, 8);
-                                    return GridView.builder(
-                                      gridDelegate:
-                                          SliverGridDelegateWithFixedCrossAxisCount(
-                                            crossAxisCount: crossAxisCount,
-                                            childAspectRatio: 0.88,
-                                            crossAxisSpacing: 12,
-                                            mainAxisSpacing: 12,
-                                          ),
-                                      itemCount: imagePaths.length,
-                                      itemBuilder: (context, index) {
+                                        _crossAxisCountForGridWidth(
+                                          constraints.maxWidth,
+                                        );
+                                    _gridCrossAxisCount = crossAxisCount;
+                                    _gridViewportWidth = constraints.maxWidth;
+                                    final selectionRect =
+                                        _dragStart != null &&
+                                            _dragCurrent != null
+                                        ? Rect.fromPoints(
+                                            _dragStart!,
+                                            _dragCurrent!,
+                                          )
+                                        : null;
+                                    return Stack(
+                                      clipBehavior: Clip.none,
+                                      children: [
+                                        GestureDetector(
+                                          behavior: HitTestBehavior.opaque,
+                                          onPanStart: _onGridPanStart,
+                                          onPanUpdate: (details) =>
+                                              _onGridPanUpdate(
+                                                details,
+                                                imagePaths,
+                                              ),
+                                          onPanEnd: _onGridPanEnd,
+                                          onPanCancel: _onGridPanCancel,
+                                          child: GridView.builder(
+                                            controller: _gridScrollController,
+                                            physics: _dragStart != null
+                                                ? const NeverScrollableScrollPhysics()
+                                                : const ClampingScrollPhysics(),
+                                            gridDelegate:
+                                                SliverGridDelegateWithFixedCrossAxisCount(
+                                                  crossAxisCount:
+                                                      crossAxisCount,
+                                                  childAspectRatio:
+                                                      _kGridChildAspectRatio,
+                                                  crossAxisSpacing:
+                                                      _kGridCrossAxisSpacing,
+                                                  mainAxisSpacing:
+                                                      _kGridMainAxisSpacing,
+                                                ),
+                                            itemCount: imagePaths.length,
+                                            itemBuilder: (context, index) {
                                         final filePath = imagePaths[index];
                                         final fileName = p.basename(filePath);
                                         final isSelected = selected.contains(
                                           filePath,
                                         );
                                         final isAnchor =
-                                            filePath == _scannedAnchorPath;
+                                            filePath == _anchorPath;
                                         final isProcessed = _processedFiles
                                             .contains(filePath);
                                         final assignedTag = tags[filePath];
@@ -2079,7 +2325,29 @@ class _HomePageState extends ConsumerState<HomePage> {
                                             ),
                                           ),
                                         );
-                                      },
+                                            },
+                                          ),
+                                        ),
+                                        if (selectionRect != null)
+                                          Positioned(
+                                            left: selectionRect.left,
+                                            top: selectionRect.top,
+                                            width: selectionRect.width,
+                                            height: selectionRect.height,
+                                            child: IgnorePointer(
+                                              child: DecoratedBox(
+                                                decoration: BoxDecoration(
+                                                  color: _kBrutalistButton
+                                                      .withValues(alpha: 0.25),
+                                                  border: Border.all(
+                                                    color: _kBrutalistButton,
+                                                    width: 1,
+                                                  ),
+                                                ),
+                                              ),
+                                            ),
+                                          ),
+                                      ],
                                     );
                                   },
                                 ),
@@ -2187,15 +2455,14 @@ class _HomePageState extends ConsumerState<HomePage> {
                                   message: scanTooltip,
                                   child: _PrimaryActionButton(
                                     onPressed:
-                                        selected.length != 1 ||
+                                        _anchorPath == null ||
                                             _isScanning ||
                                             !backend.canSendHttp
                                         ? null
                                         : () {
-                                            final key = _effectiveLicenseKey;
-                                            // Blocking gate — skipped while _kBypassLicenseGate is true.
-                                            if (!_kBypassLicenseGate &&
-                                                (key == null || key.isEmpty)) {
+                                            if (!islicensevalid ||
+                                                licensekey == null ||
+                                                licensekey!.trim().isEmpty) {
                                               _showLicenseDialog();
                                             } else {
                                               _scanSelectedAnchorPhoto();
@@ -2353,15 +2620,17 @@ class _HomePageState extends ConsumerState<HomePage> {
                               children: [
                                 Expanded(
                                   child: _PrimaryActionButton(
-                                    onPressed:
-                                        _sessionResults.isEmpty
+                                    onPressed: _sessionTags.isEmpty
                                         ? null
-                                        : _exportToCSV,
+                                        : () => _exportRosterCsv(
+                                            imagePaths,
+                                            currentLoadDirectory,
+                                          ),
                                     padding: const EdgeInsets.symmetric(
                                       vertical: 20,
                                     ),
                                     child: const Text(
-                                      'Export CSV',
+                                      'Export Roster (CSV)',
                                       style: TextStyle(
                                         fontSize: _kInputFontSize,
                                         fontWeight: FontWeight.w600,
@@ -2413,6 +2682,12 @@ class _HomePageState extends ConsumerState<HomePage> {
           ),
         ],
       ),
+          if (!islicensevalid || islicenseverifying)
+            Positioned.fill(child: _buildLicenseGateOverlay()),
+        ],
+      ),
+    );
+      },
     );
   }
 }
