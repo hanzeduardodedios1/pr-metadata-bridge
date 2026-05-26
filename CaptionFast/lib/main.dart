@@ -243,6 +243,7 @@ Future<void> main() async {
 
   if (!kIsWeb && Platform.isWindows) {
     await windowManager.ensureInitialized();
+    await windowManager.setTitle('CaptionFast');
     await windowManager.setPreventClose(true);
   }
 
@@ -251,15 +252,53 @@ Future<void> main() async {
   runApp(App(backendHost: backendHost));
 }
 
-String get _resolvedExifToolPath {
-  if (kDebugMode) {
-    return p.join(Directory.current.path, 'exiftool.exe');
+String get _expectedExifToolBinaryName {
+  if (Platform.isWindows) {
+    return 'exiftool.exe';
   }
-  return p.join(
-    File(Platform.resolvedExecutable).parent.path,
-    'exiftool.exe',
+  if (Platform.isMacOS) {
+    return 'exiftool';
+  }
+  throw UnsupportedError(
+    'ExifTool is only supported on Windows and macOS.',
   );
 }
+
+/// Install root for bundled engine binaries (ExifTool, etc.).
+String _resolveBundledEngineRoot() {
+  if (kDebugMode) {
+    return Directory.current.absolute.path;
+  }
+  final executable = File(Platform.resolvedExecutable).absolute;
+  if (Platform.isMacOS) {
+    var dir = executable.parent;
+    if (p.basename(dir.path) == 'MacOS') {
+      final contents = dir.parent;
+      if (p.basename(contents.path) == 'Contents') {
+        final appBundle = contents.parent;
+        if (p.basename(appBundle.path).endsWith('.app')) {
+          return appBundle.parent.absolute.path;
+        }
+      }
+    }
+    return dir.absolute.path;
+  }
+  if (Platform.isWindows) {
+    return executable.parent.absolute.path;
+  }
+  throw UnsupportedError(
+    'ExifTool is only supported on Windows and macOS.',
+  );
+}
+
+/// Absolute path to a bundled binary next to the install root.
+String _absoluteBundledBinaryPath(String binaryname) {
+  final installdir = _resolveBundledEngineRoot();
+  return p.normalize(p.join(installdir, binaryname));
+}
+
+/// Absolute path to the bundled ExifTool binary (install dir + binary name).
+String get exifpath => _absoluteBundledBinaryPath(_expectedExifToolBinaryName);
 
 class App extends StatefulWidget {
   const App({required this.backendHost, super.key});
@@ -328,7 +367,7 @@ class _AppState extends State<App> with WindowListener, WidgetsBindingObserver {
   Widget build(BuildContext context) {
     return MaterialApp(
       debugShowCheckedModeBanner: false,
-      title: 'VIP Tagger',
+      title: 'CaptionFast',
       theme: ThemeData(
         brightness: Brightness.dark,
         scaffoldBackgroundColor: _kBrutalistBackground,
@@ -452,6 +491,7 @@ class _StartupGateState extends State<StartupGate> {
 
   _StartupGatePhase _phase = _StartupGatePhase.loading;
   bool? _isExifToolValid;
+  String? _exiftoolrundetail;
   String _statusMessage = _kStartupStatusMessages.first;
   Timer? _statusTimer;
   int _statusMessageIndex = 0;
@@ -500,32 +540,71 @@ class _StartupGateState extends State<StartupGate> {
     setState(() => _phase = _StartupGatePhase.ready);
   }
 
+  String _formatExifToolRunFailure(ProcessResult result) {
+    final stderr = result.stderr.toString().trim();
+    if (stderr.isNotEmpty) {
+      return 'stderr: $stderr (exit ${result.exitCode})';
+    }
+    final stdout = result.stdout.toString().trim();
+    if (stdout.isNotEmpty) {
+      return 'stdout: $stdout (exit ${result.exitCode})';
+    }
+    return 'Process exited with code ${result.exitCode}';
+  }
+
+  String _formatExifToolLaunchFailure(Object error) {
+    if (error is ProcessException) {
+      return '${error.message} (OS error ${error.errorCode})';
+    }
+    return error.toString();
+  }
+
   Future<void> _checkExifTool() async {
+    final absolutepath = exifpath;
+    final engineroot = _resolveBundledEngineRoot();
     try {
-      debugPrint('Resolving path...');
-      final exiftoolPath = _resolvedExifToolPath;
-      debugPrint('Checking ExifTool at: $exiftoolPath');
-      final result = await Process.run(exiftoolPath, const <String>[
-        '-ver',
-      ]).timeout(const Duration(seconds: 3));
+      debugPrint('Checking ExifTool at: $absolutepath (cwd: $engineroot)');
+      final result = await Process.run(
+        absolutepath,
+        const <String>['-ver'],
+        workingDirectory: engineroot,
+        runInShell: false,
+      ).timeout(const Duration(seconds: 10));
       if (result.exitCode == 0) {
         if (mounted) {
           setState(() {
             _isExifToolValid = true;
+            _exiftoolrundetail = null;
           });
         }
         unawaited(_runStartup());
         return;
       }
+      final detail = _formatExifToolRunFailure(result);
+      debugPrint('ExifTool check failed (exit ${result.exitCode}): $detail');
       if (mounted) {
         setState(() {
           _isExifToolValid = false;
+          _exiftoolrundetail = detail;
+        });
+      }
+    } on TimeoutException catch (e) {
+      final detail = _formatExifToolLaunchFailure(e);
+      debugPrint('ExifTool check timed out: $detail');
+      if (mounted) {
+        setState(() {
+          _isExifToolValid = false;
+          _exiftoolrundetail = detail;
         });
       }
     } catch (e) {
-      debugPrint('ExifTool check failed: $e');
+      final detail = _formatExifToolLaunchFailure(e);
+      debugPrint('ExifTool check failed: $detail');
       if (mounted) {
-        setState(() => _isExifToolValid = false);
+        setState(() {
+          _isExifToolValid = false;
+          _exiftoolrundetail = detail;
+        });
       }
     }
   }
@@ -547,10 +626,24 @@ class _StartupGateState extends State<StartupGate> {
       );
     }
     if (_isExifToolValid == false) {
-      final targetPath = _resolvedExifToolPath;
-      final exists = File(targetPath).existsSync();
-      final exePath = Platform.resolvedExecutable;
-      final currentDir = Directory.current.path;
+      final expectedbinary = _expectedExifToolBinaryName;
+      final targetpath = exifpath;
+      final exists = File(targetpath).existsSync();
+      final exiftoolfilesdir = p.join(
+        _resolveBundledEngineRoot(),
+        'exiftool_files',
+      );
+      final exiftoolfilesexists = Directory(exiftoolfilesdir).existsSync();
+      final exepath = Platform.resolvedExecutable;
+      final installdir = _resolveBundledEngineRoot();
+      final currentdir = Directory.current.absolute.path;
+      final rundetail = _exiftoolrundetail?.trim();
+      final runerrortext = (rundetail != null && rundetail.isNotEmpty)
+          ? rundetail
+          : '(no process error captured — check Windows Event Viewer or antivirus logs)';
+      final headline = exists
+          ? 'ExifTool binary ($expectedbinary) could not be started.'
+          : 'ExifTool binary ($expectedbinary) missing. Please reinstall the application.';
       return Scaffold(
         body: Center(
           child: Padding(
@@ -561,12 +654,18 @@ class _StartupGateState extends State<StartupGate> {
                 Icon(Icons.error_outline, size: 64, color: Colors.redAccent),
                 SizedBox(height: 16),
                 Text(
-                  'ExifTool binary missing. Please reinstall the application.\n\n'
+                  '$headline\n\n'
                   '--- DIAGNOSTICS ---\n'
-                  'Target Path: $targetPath\n'
+                  'Expected Binary: $expectedbinary\n'
+                  'Target Path: $targetpath\n'
                   'File Exists: $exists\n'
-                  'Exe Path: $exePath\n'
-                  'Current Dir: $currentDir',
+                  'ExifTool Files Dir: $exiftoolfilesdir\n'
+                  'ExifTool Files Exists: $exiftoolfilesexists\n'
+                  'Install Dir: $installdir\n'
+                  'Exe Path: $exepath\n'
+                  'Current Dir: $currentdir\n'
+                  '--- OS / PROCESS ERROR ---\n'
+                  '$runerrortext',
                   textAlign: TextAlign.center,
                 ),
               ],
@@ -1079,6 +1178,11 @@ class HomePageState extends State<HomePage> {
         islicensevalid = false;
         islicenseverifying = false;
       });
+      WidgetsBinding.instance.addPostFrameCallback((_) {
+        if (mounted) {
+          unawaited(_showLicenseDialog());
+        }
+      });
       return;
     }
 
@@ -1108,6 +1212,11 @@ class HomePageState extends State<HomePage> {
       licensekey = null;
       islicensevalid = false;
       islicenseverifying = false;
+    });
+    WidgetsBinding.instance.addPostFrameCallback((_) {
+      if (mounted) {
+        unawaited(_showLicenseDialog());
+      }
     });
   }
 
@@ -1924,7 +2033,6 @@ class HomePageState extends State<HomePage> {
     });
 
     try {
-      final exifPath = _resolvedExifToolPath;
       var allSucceeded = true;
       for (final filePath in paths) {
         if (!mounted) {
@@ -1943,7 +2051,11 @@ class HomePageState extends State<HomePage> {
         ];
 
         try {
-          final result = await Process.run(exifPath, args);
+          final result = await Process.run(
+            exifpath,
+            args,
+            workingDirectory: _resolveBundledEngineRoot(),
+          );
           if (result.exitCode == 0) {
             final normalizedPath = p.normalize(filePath);
             setState(() {
